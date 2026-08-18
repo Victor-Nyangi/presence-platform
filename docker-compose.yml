@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: presence
+      POSTGRES_PASSWORD: presence
+      POSTGRES_DB: presence
+    ports: ["5432:5432"]
+    volumes:
+      # Applied in filename order on first boot of an empty volume.
+      - ./db:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U presence"]
+      interval: 5s
+      retries: 10
+
+  gateway:
+    build: ./gateway
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PRESENCE_ADDR: ":8080"
+      PRESENCE_DATABASE_URL: postgres://presence:presence@postgres:5432/presence?sslmode=disable
+      PRESENCE_KEK_ID: k1
+      PRESENCE_KEKS: ${PRESENCE_KEKS:?set PRESENCE_KEKS, see .env.example}
+      PRESENCE_TOKEN_PEPPER: ${PRESENCE_TOKEN_PEPPER:?set PRESENCE_TOKEN_PEPPER}
+    ports: ["8080:8080"]
+
+volumes:
+  pgdata:

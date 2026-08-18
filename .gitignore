@@ -1,0 +1,12 @@
+.build/
+*.o
+.env
+.env.*
+!.env.example
+
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+
+# Go
+gateway/vendor/

@@ -1,0 +1,451 @@
+openapi: 3.1.0
+info:
+  title: Presence Platform — Device API
+  version: "1.0.0"
+  description: |
+    Device-facing HTTPS API for biometric/credential presence terminals.
+
+    Every endpoint except `/v1/device/time` requires HMAC request signing.
+    See `components.securitySchemes.deviceHmac` for the canonical signing
+    string. Devices are assumed to be intermittently offline; all write
+    endpoints are idempotent.
+
+servers:
+  - url: https://api.example.com
+
+security:
+  - deviceHmac: []
+
+paths:
+
+  /v1/device/time:
+    get:
+      summary: Unauthenticated clock reference
+      description: |
+        Used to seed the RTC at boot and to recover from a `clock_skew`
+        rejection. Signing requires a roughly-correct clock, so this one
+        endpoint cannot be signed. Rate-limited per source IP.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [server_time_ms]
+                properties:
+                  server_time_ms:
+                    type: integer
+                    format: int64
+
+  /v1/device/provision:
+    post:
+      summary: Exchange a one-time provisioning token for a device secret
+      description: |
+        Called once, on first boot. Authenticated by `X-Provision-Token`
+        (printed/QR-coded at install time), not by HMAC. The returned
+        `device_secret` is shown exactly once and is never retrievable again.
+      security:
+        - provisionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [serial, firmware_version]
+              properties:
+                serial: { type: string, maxLength: 64 }
+                firmware_version: { type: string, maxLength: 32 }
+                hw_revision: { type: string, maxLength: 32 }
+      responses:
+        "200":
+          description: Provisioned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [device_id, device_secret, key_version, config, server_time_ms]
+                properties:
+                  device_id: { type: string, format: uuid }
+                  device_secret:
+                    type: string
+                    description: Base64, 32 bytes. Store in NVS. Never logged.
+                  key_version: { type: integer }
+                  org_id: { type: string, format: uuid }
+                  site_id: { type: string, format: uuid }
+                  config: { $ref: "#/components/schemas/DeviceConfig" }
+                  server_time_ms: { type: integer, format: int64 }
+        "409":
+          description: Token already consumed
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/device/heartbeat:
+    post:
+      summary: Liveness + change detection
+      description: |
+        The cheap poll, every `heartbeat_s`. Returns version counters rather
+        than data; the device only fetches roster/config/firmware deltas when
+        a counter actually moves. `backoff_s` lets the server shed load —
+        important when a whole site reconnects at once after a power cut.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [firmware_version, uptime_ms, buffer_depth]
+              properties:
+                firmware_version: { type: string }
+                uptime_ms: { type: integer, format: int64 }
+                buffer_depth:
+                  type: integer
+                  description: Unsynced events currently held in flash.
+                last_seq: { type: integer, format: int64 }
+                rssi: { type: integer }
+                free_heap: { type: integer }
+                sensor_ok: { type: boolean }
+                rtc_ok: { type: boolean }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [server_time_ms, config_version, roster_version, commands_pending, ack_through]
+                properties:
+                  server_time_ms: { type: integer, format: int64 }
+                  config_version: { type: integer }
+                  roster_version: { type: integer, format: int64 }
+                  commands_pending: { type: integer }
+                  ack_through:
+                    type: integer
+                    format: int64
+                    description: Highest contiguous device_seq durably stored server-side.
+                  backoff_s:
+                    type: integer
+                    description: If present, wait this long before the next call.
+                  firmware_available: { type: boolean }
+
+  /v1/device/events:
+    post:
+      summary: Upload buffered punch events (batch, idempotent)
+      description: |
+        At-least-once from the device; deduplicated server-side on
+        `(device_id, seq)`. The device may only truncate its local buffer up
+        to the returned `ack_through`.
+
+        A **rejected** event is still stored server-side for triage — so
+        rejections still advance `ack_through`. This is deliberate: it stops
+        one unresolvable event from wedging the buffer forever.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, events]
+              properties:
+                request_id: { type: string, format: uuid }
+                buffer_depth: { type: integer }
+                events:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items: { $ref: "#/components/schemas/PunchEvent" }
+      responses:
+        "200":
+          description: Batch processed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ack_through, accepted, duplicates, rejected, server_time_ms]
+                properties:
+                  ack_through: { type: integer, format: int64 }
+                  accepted:
+                    type: array
+                    items: { type: integer, format: int64 }
+                  duplicates:
+                    type: array
+                    items: { type: integer, format: int64 }
+                  rejected:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: { type: integer, format: int64 }
+                        reason:
+                          type: string
+                          enum: [unknown_slot, credential_revoked, person_inactive, malformed, future_timestamp]
+                  server_time_ms: { type: integer, format: int64 }
+        "401":
+          description: Signature or clock rejection
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "413": { description: Batch too large }
+        "429": { description: Rate limited; honour Retry-After }
+
+  /v1/device/commands:
+    get:
+      summary: Pull queued commands
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10, maximum: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commands:
+                    type: array
+                    items: { $ref: "#/components/schemas/Command" }
+
+  /v1/device/commands/{command_id}/result:
+    post:
+      summary: Report command outcome
+      parameters:
+        - name: command_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [succeeded, failed] }
+                result: { type: object, additionalProperties: true }
+                error: { type: string }
+      responses:
+        "204": { description: Recorded }
+
+  /v1/device/roster:
+    get:
+      summary: Fetch the slot to display-name map (delta)
+      description: |
+        Lets the terminal greet people by name while offline. Carries display
+        names and slot numbers only — never payroll numbers, admission
+        numbers, or national IDs. A lost device should not be a data breach.
+      parameters:
+        - name: since
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roster_version, full_resync, upserts, removals]
+                properties:
+                  roster_version: { type: integer, format: int64 }
+                  full_resync:
+                    type: boolean
+                    description: True when the delta is too old; wipe and replace.
+                  upserts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        slot_no: { type: integer }
+                        display_name: { type: string, maxLength: 24 }
+                        person_ref: { type: string, format: uuid }
+                  removals:
+                    type: array
+                    items: { type: integer }
+
+  /v1/device/enrollments:
+    post:
+      summary: Upload a freshly captured biometric template
+      description: |
+        Sent after an `enroll_credential` command completes on-device. The
+        template is a vendor-proprietary byte blob, never a fingerprint image.
+        The server encrypts it at rest (AES-256-GCM) before storage.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command_id, slot_no, template_b64, vendor]
+              properties:
+                command_id: { type: string, format: uuid }
+                slot_no: { type: integer }
+                template_b64: { type: string }
+                vendor: { type: string, examples: [grow_r307] }
+                quality: { type: integer, minimum: 0, maximum: 255 }
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  credential_id: { type: string, format: uuid }
+                  roster_version: { type: integer, format: int64 }
+
+  /v1/device/firmware:
+    get:
+      summary: OTA update manifest
+      parameters:
+        - name: current
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available]
+                properties:
+                  available: { type: boolean }
+                  version: { type: string }
+                  url: { type: string, format: uri }
+                  size: { type: integer }
+                  sha256: { type: string }
+                  signature:
+                    type: string
+                    description: |
+                      Ed25519 signature over the image, verified on-device
+                      against a public key burned into the firmware. Without
+                      this, OTA is a remote code execution channel.
+
+components:
+
+  securitySchemes:
+    deviceHmac:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: |
+        HMAC-SHA256, hex-encoded, over the newline-joined canonical string:
+
+            v1
+            {HTTP_METHOD}
+            {REQUEST_PATH}
+            {X-Timestamp}
+            {X-Nonce}
+            {sha256_hex(request_body)}
+
+        Required headers: `X-Device-Id`, `X-Key-Version`, `X-Timestamp`
+        (epoch ms per the device clock), `X-Nonce` (16 random bytes, hex),
+        `X-Signature`, `X-Request-Id`.
+
+        The server rejects timestamps more than 300s from its own clock with
+        `401 clock_skew` and includes `server_time_ms` so the device can
+        correct and retry once. `(device_id, nonce)` is cached for the skew
+        window to block replays.
+    provisionToken:
+      type: apiKey
+      in: header
+      name: X-Provision-Token
+
+  schemas:
+
+    PunchEvent:
+      type: object
+      required: [seq, event_uuid, captured_at, time_source, credential_kind]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          description: Strictly monotonic per device, persisted in NVS, never reused.
+        event_uuid: { type: string, format: uuid }
+        captured_at:
+          type: string
+          format: date-time
+          description: What the device RTC believed at capture time.
+        captured_uptime_ms:
+          type: integer
+          format: int64
+          description: |
+            Sent alongside captured_at so the server can reconstruct wall time
+            when the RTC was never set (time_source = uptime_only).
+        time_source:
+          type: string
+          enum: [rtc_synced, rtc_unsynced, uptime_only]
+        credential_kind:
+          type: string
+          enum: [fingerprint, rfid_card, nfc_tag, pin, qr]
+        slot_no:
+          type: integer
+          description: On-module template slot. Present for biometric matches.
+        credential_ref:
+          type: string
+          description: Hashed card/tag UID for non-biometric credentials.
+        match_score: { type: integer }
+        direction_hint:
+          type: string
+          enum: [in, out, unknown]
+          description: |
+            A hint only, from mounting position or a button press. The server
+            computes canonical direction from the person's prior state.
+        device_mode:
+          type: string
+          enum: [entry, exit, bidirectional]
+
+    Command:
+      type: object
+      required: [id, kind, payload]
+      properties:
+        id: { type: string, format: uuid }
+        kind:
+          type: string
+          enum: [enroll_credential, delete_slot, sync_roster, reboot, firmware_update, set_config, wipe_templates, revoke]
+        payload: { type: object, additionalProperties: true }
+        expires_at: { type: string, format: date-time }
+
+    DeviceConfig:
+      type: object
+      properties:
+        config_version: { type: integer }
+        mode: { type: string, enum: [entry, exit, bidirectional] }
+        timezone: { type: string, examples: ["Africa/Nairobi"] }
+        heartbeat_s: { type: integer, default: 60 }
+        flush_s: { type: integer, default: 30 }
+        max_batch: { type: integer, default: 50 }
+        debounce_ms:
+          type: integer
+          default: 5000
+          description: |
+            Suppresses repeat reads of the SAME slot within the window — that
+            is sensor bounce from a finger left on the platen, not a second
+            punch. Anything outside the window is recorded raw.
+        match_threshold: { type: integer, default: 60 }
+        allow_offline_unknown:
+          type: boolean
+          default: true
+          description: |
+            When the roster is stale, still record the punch with an unknown
+            slot rather than refusing entry. Reconcile server-side.
+
+    Problem:
+      type: object
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          enum: [clock_skew, bad_signature, nonce_replay, device_unknown, device_suspended, payload_too_large, rate_limited]
+        server_time_ms: { type: integer, format: int64 }
+        detail: { type: string }
