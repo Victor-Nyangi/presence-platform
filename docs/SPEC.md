@@ -64,6 +64,11 @@ Anything `low` lands in an admin review queue rather than quietly polluting payr
 
 **`schedule.day_boundary`** — defaults to `04:00`, not midnight. A nurse clocking out at 02:00 belongs to the previous business day. Getting this wrong is the single most common attendance-system bug.
 
+Two consequences that follow from the boundary and are worth stating explicitly, because they are easy to get backwards:
+
+- The `overnight` anomaly means a span crossed a **business** day, not midnight. A routine 19:00→03:30 night shift sits inside one business day and is therefore *clean* — flagging it would fill the review queue with normal work.
+- A span is attributed wholly to the day it **started**. Hours are never divided between two days, so one shift stays one auditable unit. Proportional splitting, if a payroll integration ever needs it, belongs at export time.
+
 **`notification.dedupe_key`** — `arrival:<person_id>:<date>`, unique-indexed. A child scanning twice at the gate must not send a parent two SMS. Parents notice; it's the fastest way to lose a school.
 
 ### Direction is computed server-side

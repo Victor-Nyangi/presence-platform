@@ -23,14 +23,14 @@ Full reasoning: [`docs/SPEC.md`](docs/SPEC.md).
 ```
 docs/       SPEC.md (design + protocol) and openapi.yaml (device API)
 db/         Postgres schema and invariant tests
-gateway/    Go device-facing ingest service
+gateway/    Go device-facing ingest service + attendance engine
 firmware/   ESP32 / PlatformIO terminal
 ```
 
 ## Quick start
 
 ```bash
-cd gateway && go mod tidy && cd ..   # generates go.sum on first checkout
+cd gateway && go mod tidy && cd ..   # generates go.sum (not committed) on first checkout
 docker compose up -d postgres
 make db-load          # apply schema, run invariant tests
 make test             # gateway unit tests + firmware host tests
@@ -70,6 +70,30 @@ No defaults for secrets, deliberately: a gateway that silently boots with a deve
 
 Device HMAC secrets are stored **encrypted, not hashed** — verifying an HMAC requires the raw key, so a hash would be unverifiable. They are sealed with AES-256-GCM under a KEK held outside the database, with the device id as additional authenticated data, so a Postgres dump alone yields nothing forgeable.
 
+## The attendance engine
+
+The gateway stores what happened. This turns it into what it means.
+
+`internal/attendance` is split deliberately: `rules.go` is pure — no database, no clock, no I/O — because the hard parts of attendance are rules, not queries, and rules can only be exercised exhaustively if they don't need Postgres. `engine.go` reads rows, calls into the rules, and writes rows back.
+
+```bash
+recompute -org <uuid> -days 7 -review
+```
+
+Rebuilding is destructive-and-rebuild, and safe to run as often as you like. `attendance_span` and `attendance_day` contain nothing that cannot be regenerated from `punch_event` plus `punch_amendment` — that is the entire reason the event log is append-only. When a customer changes their grace period six months in, you re-run this.
+
+The rules that matter, and why:
+
+- **The day boundary defaults to 04:00, not midnight.** A nurse clocking out at 02:00 belongs to the shift that began the previous evening. Getting this wrong splits one night shift across two days' totals, and it is the most common attendance bug there is.
+- **An ordinary night shift is not an anomaly.** `overnight` means "crossed a *business* day", not "crossed midnight". If 19:00→03:30 were flagged, every night nurse would generate a review item every shift and the queue would be useless inside a week.
+- **Hours are never split across days.** A span is attributed wholly to the day it started, so one shift stays one auditable unit. If a payroll integration needs proportional splitting, it should do that at export time from the span's start and end.
+- **An open span accrues zero time.** A forgotten clock-out would otherwise quietly bill hundreds of hours. It is flagged `missing_out` and the day goes to review.
+- **Two clock-ins never merge into one long shift.** Merging would turn someone's mistake into paid hours.
+- **An orphan clock-out is recorded, not discarded** — but it never counts as an arrival, or the person would look wildly late.
+- **Anomalies are facts, not errors.** Attendance data that hides its own uncertainty is worse than data that admits it. Anything unusual sets `needs_review`, which is what puts a day in front of a human before it reaches payroll.
+
+Corrections are additive `punch_amendment` rows, never edits — the raw event is immutable. Later amendment wins, per field.
+
 ## The firmware
 
 Two FreeRTOS tasks, and one rule: **the scan loop never blocks on the network.** Core 1 scans, buffers and beeps; core 0 drains the buffer whenever it can.
@@ -106,9 +130,10 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 - [x] Schema, invariants, device protocol
 - [x] Gateway: signing, idempotent ingest, commands, roster
 - [x] Firmware: buffer + signing logic, host-tested
+- [x] Attendance engine: pairing, day boundary, amendments, review queue
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
 - [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to
-- [ ] Derived attendance + admin UI
+- [ ] Admin UI over the review queue
 - [ ] Guardian notifications (Africa's Talking / WhatsApp)
 - [ ] HR and school-portal integrations
 

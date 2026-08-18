@@ -23,8 +23,12 @@ firmware-test: ## Compile and run firmware logic tests on the host
 		firmware/test/host_test.cpp firmware/src/crc32.cpp
 	@./.build/fwtest
 
-build: ## Build the gateway binary
+build: ## Build the gateway and recompute binaries
 	cd gateway && go build -o ../.build/gateway ./cmd/gateway
+	cd gateway && go build -o ../.build/recompute ./cmd/recompute
+
+recompute: build ## Rebuild derived attendance: make recompute ORG=<uuid> DAYS=7
+	./.build/recompute -org "$(ORG)" -days "$(or $(DAYS),1)" -review
 
 run: build ## Run the gateway
 	./.build/gateway
