@@ -2,7 +2,7 @@
 
 Credential-agnostic presence and attendance tracking for offices, hospitals and schools. Terminals read a fingerprint (or a card, or a PIN) and record *who was here, when* — reliably, including while the network is down.
 
-> **Status: early.** The gateway and schema are built and tested. The firmware is a skeleton — its protocol-critical logic (ring buffer, signing) is covered by host tests, but `main.cpp` has four JSON/NVS helpers still unimplemented and does not link yet, and none of it has been run on hardware.
+> **Status: early.** The gateway and schema are built and tested. The firmware's protocol-critical logic — ring buffer, signing string, batch serialisation, response parsing — is covered by host tests, and the batch payload it produces has been checked against the real gateway. It still will not run on a board: `setup()` never constructs the ring buffer, because the LittleFS-backed `Storage` implementation does not exist yet, and none of the code has been built with the ESP32 toolchain.
 
 ## Why this exists
 
@@ -163,6 +163,9 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 - [x] Schema, invariants, device protocol
 - [x] Gateway: signing, idempotent ingest, commands, roster
 - [x] Firmware: buffer + signing logic, host-tested
+- [x] Firmware: batch serialisation + response parsing, host-tested against the gateway
+- [ ] Firmware: LittleFS `Storage` implementation — until this exists `g_buffer` is null and the terminal cannot run
+- [ ] Firmware: first build with the ESP32 toolchain, then first run on hardware
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
 - [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to
