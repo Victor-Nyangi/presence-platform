@@ -19,7 +19,6 @@ Credential-agnostic presence/attendance tracking. Three deployables in one repo,
 Everything is driven from the repo-root `Makefile` (`make help` lists targets). `DB_URL` defaults to the docker-compose Postgres.
 
 ```bash
-cd gateway && go mod tidy && cd ..   # REQUIRED on a fresh checkout: go.sum is not committed
 docker compose up -d postgres
 make db-load            # apply 001_schema.sql, then run 002_smoke_test.sql
 make test               # gateway unit tests + firmware host tests
@@ -45,7 +44,7 @@ CI (`.github/workflows/ci.yml`) runs: schema + smoke test, `go vet`, a `gofmt -l
 ### Test layout gotchas
 
 - Integration tests are behind `//go:build integration` and **skip silently** without `PRESENCE_TEST_DATABASE_URL`. `make test` therefore does not run them — a passing `make test` proves much less than it looks like.
-- They also need `-p 1`. The `api` and `attendance` suites each `TRUNCATE` and re-seed the *same* database, so `go test`'s default package parallelism makes them clobber each other. `make test-integration` passes the flag; `.github/workflows/ci.yml:52` does **not**, so CI is intermittently red for this reason.
+- They also need `-p 1`. The `api` and `attendance` suites each `TRUNCATE` and re-seed the *same* database, so `go test`'s default package parallelism makes them clobber each other. Both `make test-integration` and CI pass the flag; dropping it makes the suite intermittently red.
 - Those tests `TRUNCATE` core tables on setup. Never point `PRESENCE_TEST_DATABASE_URL` at a database you care about.
 - `db/` is mounted as `/docker-entrypoint-initdb.d` in compose, so both SQL files run on first boot of an empty volume. `002_smoke_test.sql` ends in `ROLLBACK`, so it leaves no rows.
 - `firmware/test/host_test.cpp` is a single hand-rolled binary (no framework, no `-run` filter); it compiles only `crc32.cpp` alongside itself.

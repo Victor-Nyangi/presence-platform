@@ -30,7 +30,6 @@ firmware/   ESP32 / PlatformIO terminal
 ## Quick start
 
 ```bash
-cd gateway && go mod tidy && cd ..   # generates go.sum (not committed) on first checkout
 docker compose up -d postgres        # binds host port 5432; see below if that is taken
 make seed             # create the bench fixture, print the device secret
 make db-load          # apply schema, run invariant tests
