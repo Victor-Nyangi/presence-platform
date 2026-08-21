@@ -110,11 +110,16 @@ Breaking one of these looks like a small change and isn't:
 
 The four previously-unimplemented helpers are done. `buildEventsJson` and `parseAckThrough` moved into `firmware/src/events_json.h`; `handleClockSkew` and `sendHeartbeat` are Arduino wrappers in `main.cpp`.
 
-**It still cannot run on a board:** `setup()` never constructs `g_buffer` — the line is commented out because no LittleFS-backed `Storage` implementation exists — so the scan and net tasks would dereference null. Nothing here has been built with the ESP32 toolchain or run on hardware.
+`setup()` now constructs the buffer: `firmware/src/littlefs_storage.h` implements `Storage` over LittleFS, with cursors in a single NVS entry. A terminal whose buffer will not open goes to `State::Fault` rather than booting and silently dropping punches, and prints its real record count at startup.
 
-What *is* tested lives in `ring_buffer.h`, `canonical.h` and `events_json.h`, kept free of Arduino headers precisely so it compiles under plain `g++`. `events_json.h` also avoids `printf`: ESP-IDF's default newlib-nano does not handle `%lld` without an sdkconfig flag, and a wire format should not depend on a build option. Two ordering rules in that code are the whole point of it:
+**Nothing here has been built with the ESP32 toolchain or run on hardware.** `littlefs_storage.h` is the only firmware file that cannot compile on the host — it is a binding onto LittleFS and NVS, and is kept deliberately thin for that reason. Every decision it would otherwise make (capacity arithmetic, ring geometry, cursor validation) lives in `ring_buffer.h` under test instead.
+
+**Buffer capacity is set by the partition table, not the flash size.** `min_spiffs.csv` leaves roughly 128KB of filesystem — on the order of 2,000 events. `ringCapacityBytes` sizes the ring from what the partition actually reports, so enlarging it later grows the buffer with no code change. An existing ring file keeps its own size regardless, because `RingBuffer` indexes modulo the slot count and changing capacity under buffered records would scatter them.
+
+What *is* tested lives in `ring_buffer.h`, `canonical.h` and `events_json.h`, kept free of Arduino headers precisely so it compiles under plain `g++`. `test/host_test.cpp` also carries a `FileStorage` mirroring `LittleFsStorage` against stdio, so persistence across a restart is exercised with real file I/O rather than a `std::vector`. `events_json.h` also avoids `printf`: ESP-IDF's default newlib-nano does not handle `%lld` without an sdkconfig flag, and a wire format should not depend on a build option. Two ordering rules in that code are the whole point of it:
 
 - **Confirm the punch only after the flash write succeeds.** Beeping green on a failed write tells someone they clocked in when they didn't.
 - **Commit the sequence number to NVS before using it.** The reverse order reuses a number after a reboot and silently destroys idempotency.
+- **Both cursors go in one NVS entry.** `depth()` is unsigned subtraction, so a torn pair with the tail past the head does not fault — it underflows to ~1.8e19 and pins `full()` true, quietly evicting a good record on every punch. `RingBuffer::begin` clamps such a pair as defence in depth.
 
 `PunchRecord` is a 60-byte packed POD with a `static_assert` on its size — changing the layout is a storage format break.

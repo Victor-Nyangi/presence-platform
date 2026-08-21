@@ -146,7 +146,7 @@ Response returns `ack_through`: the highest seq **in that batch** such that ever
 | **Device secret stolen** | Queue `revoke`; set `device.state='suspended'`. Server rejects that `key_version`. Rotation via `prev_secret_enc` needs no site visit. |
 | **Finger left on the sensor** | Firmware suppresses repeat reads of the *same slot* within `debounce_ms` (5s) — that's sensor bounce, not a second punch. Anything outside the window is recorded raw and deduped in the derived layer. |
 | **Roster stale, unknown finger** | `allow_offline_unknown=true`: record the punch with the raw slot, let the person through, reconcile server-side. Refusing a nurse entry because your roster lagged is how you lose the account. |
-| **Power cut mid-flash-write** | Fixed-size 64-byte buffer records with CRC32; corrupt records skipped on read. Head/tail pointers in NVS. |
+| **Power cut mid-flash-write** | Fixed-size 60-byte buffer records with CRC32; corrupt records skipped on read. Head/tail pointers in NVS, written as a single entry so the pair cannot tear. |
 | **Whole site reconnects at once** | Server returns `backoff_s`; device applies exponential backoff with jitter, 5s → 300s cap. |
 | **Attendance rules change retroactively** | Truncate `attendance_span` + `attendance_day`, recompute from `punch_event` + `punch_amendment`. Raw data untouched. |
 
@@ -198,7 +198,9 @@ Matching happens *on the sensor module*, which returns a slot number and score. 
 
 Never touches the scan loop's state directly; they communicate through the flash ring buffer and a FreeRTOS queue.
 
-**Buffer:** fixed-size 64-byte records in a LittleFS ring file, CRC32 per record, head/tail in NVS. Fixed-size records give O(1) append and no fragmentation. At 4MB flash you can hold tens of thousands of events — days of offline operation.
+**Buffer:** fixed-size 60-byte records in a LittleFS ring file, CRC32 per record, head/tail in NVS. Fixed-size records give O(1) append and no fragmentation. The ring file is preallocated at full size on first boot, so running out of space fails at startup rather than mid-outage.
+
+**Capacity is set by the partition table, not the flash size.** `min_spiffs.csv` spends a 4MB part on two 1.875MB OTA app slots and leaves roughly 128KB for the filesystem — on the order of 2,000 events, or about two days for a 500-person site punching twice daily. That clears the bar, but by far less margin than "4MB of flash" suggests. The firmware sizes the ring from whatever the partition actually reports rather than a hard-coded number, so trading app space for filesystem later grows the buffer with no code change; the terminal prints its real record count at boot. Any such trade has to be measured against the OTA rollback budget, since shrinking the app slots below what the firmware needs bricks the build.
 
 **Sequence counter:** in NVS, `commit → then use`. If power drops between commit and use you burn a number, which is harmless. The reverse order would reuse one, which silently destroys idempotency.
 

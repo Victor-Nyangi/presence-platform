@@ -42,6 +42,7 @@
 
 #include "canonical.h"
 #include "events_json.h"
+#include "littlefs_storage.h"
 #include "ring_buffer.h"
 
 namespace {
@@ -72,6 +73,7 @@ Preferences g_nvs;
 RTC_DS3231 g_rtc;
 Adafruit_Fingerprint g_finger(&Serial2);
 
+presence::LittleFsStorage* g_storage = nullptr;
 presence::RingBuffer* g_buffer = nullptr;
 QueueHandle_t g_feedbackQueue = nullptr;
 
@@ -452,7 +454,23 @@ void setup() {
   g_rtcOffsetMs = g_nvs.getLong64("rtc_offset", 0);
 
   g_feedbackQueue = xQueueCreate(8, sizeof(uint8_t));
-  // g_buffer = new presence::RingBuffer(new LittleFsStorage(...));
+
+  // The buffer is what makes an outage survivable, so a terminal that
+  // cannot open one is faulted rather than left running. Booting without it
+  // would look healthy and silently drop every punch taken offline.
+  g_storage = new presence::LittleFsStorage(&g_nvs);
+  g_buffer = new presence::RingBuffer(g_storage);
+  if (!g_storage->begin() || !g_buffer->begin()) {
+    Serial.println("FAULT: punch buffer unavailable");
+    g_state = State::Fault;
+  } else {
+    // Printed because the capacity is computed from whatever the LittleFS
+    // partition actually has. This line is the authoritative answer to how
+    // long an outage this device can ride out; docs can only estimate it.
+    Serial.printf("punch buffer: %u records, %u buffered\n",
+                  static_cast<unsigned>(g_storage->records()),
+                  static_cast<unsigned>(g_buffer->depth()));
+  }
 
   if (!g_nvs.isKey("device_secret")) {
     g_state = State::Provision;

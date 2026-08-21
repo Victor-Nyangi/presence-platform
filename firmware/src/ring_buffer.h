@@ -55,6 +55,31 @@ class Storage {
   virtual bool loadCursors(uint64_t* head, uint64_t* tail) = 0;
 };
 
+// ringCapacityBytes decides how large the ring file should be, given what
+// the filesystem reports. Sizing at runtime rather than hard-coding a number
+// means that enlarging the LittleFS partition later grows the buffer with no
+// code change -- which matters, because the partition table is the binding
+// constraint on how long an outage the terminal can ride out, not the flash
+// size.
+//
+// existingRingBytes is added back because usedBytes already counts the ring
+// file we are about to reopen. Leaving it out shrinks the buffer to nothing
+// on the second boot.
+//
+// Returns 0 when the partition cannot hold minRecords, so the caller can
+// fault loudly at startup instead of booting with a buffer too small to
+// cover an outage.
+inline size_t ringCapacityBytes(size_t totalBytes, size_t usedBytes,
+                                size_t existingRingBytes, size_t reserveBytes,
+                                size_t minRecords) {
+  if (usedBytes > totalBytes) return 0;
+  const size_t available = (totalBytes - usedBytes) + existingRingBytes;
+  if (available <= reserveBytes) return 0;
+  const size_t records = (available - reserveBytes) / sizeof(PunchRecord);
+  if (records < minRecords) return 0;
+  return records * sizeof(PunchRecord);
+}
+
 class RingBuffer {
  public:
   explicit RingBuffer(Storage* storage) : storage_(storage) {}
@@ -65,6 +90,18 @@ class RingBuffer {
     if (!storage_->loadCursors(&head_, &tail_)) {
       head_ = tail_ = 0;
     }
+    // Cursors come back from NVS, where a power cut or a corrupt entry can
+    // leave a pair the API itself could never produce. Neither case is
+    // survivable unchecked, because depth() is unsigned subtraction: a tail
+    // past the head does not fault, it underflows to ~1.8e19 and pins full()
+    // true, so every later punch silently evicts a good record. A head
+    // further ahead than the ring holds is the same kind of lie in the other
+    // direction -- those records have already been overwritten.
+    //
+    // Clamping costs at most one buffer of already-unrecoverable records;
+    // trusting the pair corrupts every punch from here on.
+    if (tail_ > head_) tail_ = head_;
+    if (head_ - tail_ > slots_) tail_ = head_ - slots_;
     return true;
   }
 
@@ -76,6 +113,12 @@ class RingBuffer {
   // give the user a green light before this succeeds — confirming a punch
   // that was never persisted is worse than a slow beep.
   bool append(PunchRecord rec) {
+    // begin() never succeeded, so there is nowhere to put this. Returning
+    // false makes the caller withhold the green light, which is the right
+    // answer; indexing by "head % slots" with no slots would instead take
+    // the terminal down with a divide-by-zero on every punch.
+    if (slots_ == 0) return false;
+
     rec.crc32 = crc32(reinterpret_cast<const uint8_t*>(&rec), sizeof(PunchRecord) - 4);
 
     // A full buffer means a very long outage. Dropping the OLDEST record is
