@@ -67,12 +67,103 @@ class MemStorage : public Storage {
     buf_[index * sizeof(PunchRecord) + 4] ^= 0xFF;
   }
   void failNextWrite() { failNextWrite_ = true; }
+  // Plant a cursor pair that the API itself could never produce.
+  void setCursors(uint64_t head, uint64_t tail) { head_ = head; tail_ = tail; }
 
  private:
   std::vector<uint8_t> buf_;
   uint64_t head_ = 0, tail_ = 0;
   bool failNextWrite_ = false;
 };
+
+// ---------------------------------------------------------------------
+// FileStorage -- the same shape as the on-device LittleFsStorage, but on
+// stdio.
+//
+// LittleFS itself needs hardware, so what this pins down is the part that
+// does not: that records and cursors genuinely survive the process going
+// away, with the cursors in a separate store from the data exactly as NVS
+// is separate from the ring file on the device. That separation is the
+// reason a torn data write cannot orphan the cursors, so it is worth
+// testing against something that really is two files.
+//
+// These are characterisation tests over RingBuffer rather than tests that
+// drove new code -- they are the closest thing to the "unplug it mid-day"
+// milestone that runs without a board.
+// ---------------------------------------------------------------------
+class FileStorage : public Storage {
+ public:
+  FileStorage(const std::string& dataPath, const std::string& cursorPath, size_t bytes)
+      : dataPath_(dataPath), cursorPath_(cursorPath), bytes_(bytes) {
+    f_ = fopen(dataPath_.c_str(), "r+b");
+    if (f_ == nullptr) {
+      // First boot: create the file at full size rather than growing it as
+      // punches arrive. On LittleFS a write past the high-water mark can
+      // fail for want of space, and it would do so during an outage -- the
+      // one moment the buffer is the only copy of the data. Preallocating
+      // moves that failure to startup, where it is visible.
+      f_ = fopen(dataPath_.c_str(), "w+b");
+      if (f_ == nullptr) return;
+      const std::vector<uint8_t> zeros(bytes_, 0);
+      fwrite(zeros.data(), 1, zeros.size(), f_);
+      fflush(f_);
+    }
+  }
+  ~FileStorage() override {
+    if (f_ != nullptr) fclose(f_);
+  }
+
+  bool ok() const { return f_ != nullptr; }
+
+  bool readAt(size_t offset, uint8_t* dst, size_t len) override {
+    if (f_ == nullptr || offset + len > bytes_) return false;
+    if (fseek(f_, static_cast<long>(offset), SEEK_SET) != 0) return false;
+    return fread(dst, 1, len, f_) == len;
+  }
+  bool writeAt(size_t offset, const uint8_t* src, size_t len) override {
+    if (f_ == nullptr || offset + len > bytes_) return false;
+    if (fseek(f_, static_cast<long>(offset), SEEK_SET) != 0) return false;
+    if (fwrite(src, 1, len, f_) != len) return false;
+    return fflush(f_) == 0;
+  }
+  size_t capacityBytes() const override { return bytes_; }
+
+  // One record holding both cursors, mirroring the single NVS blob the
+  // device writes. Two separate entries could tear against each other.
+  bool saveCursors(uint64_t head, uint64_t tail) override {
+    FILE* c = fopen(cursorPath_.c_str(), "wb");
+    if (c == nullptr) return false;
+    const uint64_t pair[2] = {head, tail};
+    const bool wrote = fwrite(pair, sizeof(pair), 1, c) == 1;
+    fclose(c);
+    return wrote;
+  }
+  bool loadCursors(uint64_t* head, uint64_t* tail) override {
+    FILE* c = fopen(cursorPath_.c_str(), "rb");
+    if (c == nullptr) return false;
+    uint64_t pair[2] = {0, 0};
+    const bool read = fread(pair, sizeof(pair), 1, c) == 1;
+    fclose(c);
+    if (!read) return false;
+    *head = pair[0];
+    *tail = pair[1];
+    return true;
+  }
+
+ private:
+  std::string dataPath_;
+  std::string cursorPath_;
+  size_t bytes_;
+  FILE* f_ = nullptr;
+};
+
+static const char* kRingPath = ".build/fwtest_ring.bin";
+static const char* kCursorPath = ".build/fwtest_cursors.bin";
+
+static void clearRingFiles() {
+  remove(kRingPath);
+  remove(kCursorPath);
+}
 
 static PunchRecord makeRecord(uint64_t seq) {
   PunchRecord r{};
@@ -230,6 +321,178 @@ static void testCursorsSurviveReboot() {
   PunchRecord out[8];
   const size_t n = rebooted.peek(out, 8);
   check(n == 2 && out[0].seq == 2, "resumes at the right sequence");
+}
+
+// ---------------------------------------------------------------------
+// Ring file sizing (ring_buffer.h)
+//
+// The device sizes its ring file from whatever the LittleFS partition
+// actually has, rather than a magic number, so that enlarging the
+// partition later grows the buffer with no code change. The arithmetic
+// is pure and lives here because getting it wrong is silent: the buffer
+// just ends up smaller than anyone thinks it is.
+// ---------------------------------------------------------------------
+static void testRingCapacitySizing() {
+  printf("ring sizing\n");
+  const size_t rec = sizeof(PunchRecord);
+
+  // 10 records' worth of space plus a stray 17 bytes: the remainder is
+  // unusable, because RingBuffer indexes by whole records.
+  check(ringCapacityBytes(rec * 10 + 17, 0, 0, 0, 1) == rec * 10,
+        "rounds down to a whole number of records");
+
+  check(ringCapacityBytes(rec * 10, 0, 0, rec * 2, 1) == rec * 8,
+        "holds back the reserve for filesystem metadata");
+
+  // The second boot is the one that catches people out: usedBytes now
+  // includes the ring file itself, so a naive free-space calculation
+  // shrinks the buffer to nothing on every restart.
+  check(ringCapacityBytes(rec * 10, rec * 10, rec * 10, 0, 1) == rec * 10,
+        "reclaims the existing ring file instead of shrinking each boot");
+
+  check(ringCapacityBytes(rec * 4, 0, 0, 0, 8) == 0,
+        "refuses a partition too small to hold the minimum");
+
+  check(ringCapacityBytes(rec * 4, rec * 9, 0, 0, 1) == 0,
+        "returns zero rather than underflowing when used exceeds total");
+
+  check(ringCapacityBytes(rec * 4, 0, 0, rec * 9, 1) == 0,
+        "returns zero when the reserve exceeds what is available");
+}
+
+// A cursor pair with the tail past the head is not reachable through the
+// API; it means the persisted cursors were corrupted. It must not survive
+// begin(), because depth() is unsigned subtraction -- tail > head does not
+// fault, it underflows to ~1.8e19 and leaves full() permanently true, so
+// every subsequent punch silently evicts a good record.
+static void testCorruptCursorsDoNotUnderflowDepth() {
+  printf("corrupt cursors\n");
+  MemStorage st(sizeof(PunchRecord) * 8);
+  st.setCursors(2, 5);
+  RingBuffer rb(&st);
+  check(rb.begin(), "begin still succeeds");
+  check(rb.depth() == 0, "an impossible cursor pair does not underflow depth");
+  check(!rb.full(), "and does not leave the buffer permanently full");
+}
+
+// Likewise a head further ahead of the tail than the ring can hold: the
+// records in between no longer exist, so claiming that depth would hand
+// peek() a wrapped, misleading view of the file.
+static void testCursorsBeyondCapacityAreClamped() {
+  printf("cursors beyond capacity\n");
+  MemStorage st(sizeof(PunchRecord) * 4);
+  st.setCursors(100, 0);
+  RingBuffer rb(&st);
+  check(rb.begin(), "begin still succeeds");
+  check(rb.depth() == 4, "depth is clamped to what the ring can actually hold");
+}
+
+// A buffer whose begin() failed has no slots, and append() indexes with
+// "head % slots". Nothing should call it in that state -- scanTask is gated
+// on State::Ready and a failed buffer faults the terminal -- but "nothing
+// should" is not a guarantee, and the failure mode is a divide-by-zero
+// reboot loop rather than a dropped punch.
+static void testAppendOnUnstartedBufferFails() {
+  printf("unstarted buffer\n");
+  MemStorage st(0);
+  RingBuffer rb(&st);
+  check(!rb.begin(), "begin refuses a storage with no room for a record");
+  check(!rb.append(makeRecord(1)),
+        "append reports failure rather than dividing by zero");
+}
+
+static void testRecordsSurviveProcessRestart() {
+  printf("restart persistence\n");
+  clearRingFiles();
+  const size_t bytes = sizeof(PunchRecord) * 8;
+  {
+    FileStorage st(kRingPath, kCursorPath, bytes);
+    RingBuffer rb(&st);
+    assert(rb.begin());
+    for (uint64_t i = 1; i <= 5; i++) assert(rb.append(makeRecord(i)));
+  }
+  FileStorage reopened(kRingPath, kCursorPath, bytes);
+  RingBuffer rb(&reopened);
+  check(rb.begin(), "reopens an existing ring file");
+  check(rb.depth() == 5, "every buffered punch survived the restart");
+  PunchRecord out[8];
+  const size_t n = rb.peek(out, 8);
+  check(n == 5 && out[0].seq == 1 && out[4].seq == 5,
+        "records come back in order with their sequence numbers intact");
+}
+
+static void testAckStateSurvivesRestart() {
+  printf("restart ack state\n");
+  clearRingFiles();
+  const size_t bytes = sizeof(PunchRecord) * 8;
+  {
+    FileStorage st(kRingPath, kCursorPath, bytes);
+    RingBuffer rb(&st);
+    assert(rb.begin());
+    for (uint64_t i = 1; i <= 5; i++) assert(rb.append(makeRecord(i)));
+    rb.ackThrough(3);
+  }
+  FileStorage reopened(kRingPath, kCursorPath, bytes);
+  RingBuffer rb(&reopened);
+  assert(rb.begin());
+  check(rb.depth() == 2, "acknowledged records stay dropped across a restart");
+  PunchRecord out[8];
+  const size_t n = rb.peek(out, 8);
+  check(n == 2 && out[0].seq == 4,
+        "the device does not resend what the server already stored");
+}
+
+static void testTornRecordInFileIsSkippedAfterRestart() {
+  printf("restart torn record\n");
+  clearRingFiles();
+  const size_t bytes = sizeof(PunchRecord) * 8;
+  {
+    FileStorage st(kRingPath, kCursorPath, bytes);
+    RingBuffer rb(&st);
+    assert(rb.begin());
+    for (uint64_t i = 1; i <= 4; i++) assert(rb.append(makeRecord(i)));
+  }
+  // Corrupt the third record in the file itself, the way a power cut
+  // partway through a write would.
+  {
+    FILE* f = fopen(kRingPath, "r+b");
+    assert(f != nullptr);
+    assert(fseek(f, static_cast<long>(sizeof(PunchRecord) * 2 + 4), SEEK_SET) == 0);
+    uint8_t b = 0;
+    assert(fread(&b, 1, 1, f) == 1);
+    b ^= 0xFF;
+    assert(fseek(f, static_cast<long>(sizeof(PunchRecord) * 2 + 4), SEEK_SET) == 0);
+    assert(fwrite(&b, 1, 1, f) == 1);
+    fclose(f);
+  }
+  FileStorage reopened(kRingPath, kCursorPath, bytes);
+  RingBuffer rb(&reopened);
+  assert(rb.begin());
+  PunchRecord out[8];
+  const size_t n = rb.peek(out, 8);
+  check(n == 3, "the torn record is skipped and the rest still upload");
+  bool sawThree = false;
+  for (size_t i = 0; i < n; i++) {
+    if (out[i].seq == 3) sawThree = true;
+  }
+  check(!sawThree, "the torn record itself is never returned");
+}
+
+static void testRingFileIsPreallocatedToFullSize() {
+  printf("preallocation\n");
+  clearRingFiles();
+  const size_t bytes = sizeof(PunchRecord) * 8;
+  FileStorage st(kRingPath, kCursorPath, bytes);
+  check(st.ok(), "the ring file is created on first boot");
+  FILE* f = fopen(kRingPath, "rb");
+  assert(f != nullptr);
+  assert(fseek(f, 0, SEEK_END) == 0);
+  const long size = ftell(f);
+  fclose(f);
+  check(size == static_cast<long>(bytes),
+        "the file is full size before the first punch, so a write during an "
+        "outage cannot fail for space");
+  clearRingFiles();
 }
 
 // ---------------------------------------------------------------------
@@ -402,6 +665,14 @@ int main() {
   testFailedWriteIsReported();
   testOverflowDropsOldest();
   testCursorsSurviveReboot();
+  testRingCapacitySizing();
+  testCorruptCursorsDoNotUnderflowDepth();
+  testCursorsBeyondCapacityAreClamped();
+  testAppendOnUnstartedBufferFails();
+  testRecordsSurviveProcessRestart();
+  testAckStateSurvivesRestart();
+  testTornRecordInFileIsSkippedAfterRestart();
+  testRingFileIsPreallocatedToFullSize();
   testRfc3339Formatting();
   testUuidFormatting();
   testBatchWireShape();
