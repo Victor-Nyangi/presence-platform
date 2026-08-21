@@ -1,8 +1,11 @@
 // main.cpp — ESP32 presence terminal.
 //
-// STATUS: skeleton. The structure, task split, and ordering rules below are
-// the design that matters and are what the host tests cover. The sensor,
-// Wi-Fi and NVS calls are wired but have not been run on hardware.
+// STATUS: complete but UNPROVEN ON HARDWARE. The structure, task split, and
+// ordering rules below are the design that matters, and the protocol-critical
+// pieces (ring buffer, signing string, batch serialisation, response parsing)
+// are covered by host tests that run without an ESP32. Everything that
+// touches the sensor, Wi-Fi, RTC or NVS is wired but has never been executed
+// on a real board.
 //
 // The one rule this file exists to enforce: THE SCAN LOOP NEVER BLOCKS ON THE
 // NETWORK. A nurse at 3am does not care that the uplink is down. Scanning,
@@ -38,6 +41,7 @@
 #include <mbedtls/sha256.h>
 
 #include "canonical.h"
+#include "events_json.h"
 #include "ring_buffer.h"
 
 namespace {
@@ -63,6 +67,7 @@ const char* kApiBase = "https://api.example.com";
 enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
 
 State g_state = State::Boot;
+uint32_t g_backoffMs = kBackoffMinMs;
 Preferences g_nvs;
 RTC_DS3231 g_rtc;
 Adafruit_Fingerprint g_finger(&Serial2);
@@ -130,6 +135,23 @@ std::string randomNonce() {
     snprintf(buf + i, 9, "%08x", static_cast<unsigned>(esp_random()));
   }
   return std::string(buf, 32);
+}
+
+// randomUuid formats 16 random bytes as a v4 UUID. The gateway stores
+// request_id in a uuid column, so anything else is a 500 on ingest rather
+// than a clean rejection.
+std::string randomUuid() {
+  uint8_t raw[16];
+  for (int i = 0; i < 16; i += 4) {
+    const uint32_t r = esp_random();
+    raw[i + 0] = static_cast<uint8_t>(r);
+    raw[i + 1] = static_cast<uint8_t>(r >> 8);
+    raw[i + 2] = static_cast<uint8_t>(r >> 16);
+    raw[i + 3] = static_cast<uint8_t>(r >> 24);
+  }
+  raw[6] = (raw[6] & 0x0F) | 0x40;
+  raw[8] = (raw[8] & 0x3F) | 0x80;
+  return presence::formatUuid(raw);
 }
 
 // signedPost returns the HTTP status, or a negative value on transport error.
@@ -243,17 +265,96 @@ void feedbackTask(void*) {
 // buffer and the feedback queue are the only shared surfaces.
 // --------------------------------------------------------------------
 
-// NOT YET IMPLEMENTED. Declared here so the control flow below reads as
-// intended; this file does not link until they exist. Each is mechanical
-// (ArduinoJson serialisation and one NVS write) and none of them changes the
-// design — which is why the tested logic lives in ring_buffer.h and
-// canonical.h instead.
-std::string buildEventsJson(const presence::PunchRecord* batch, size_t n);
-int64_t parseAckThrough(const String& response);
-void handleClockSkew(const String& problemResponse);  // reads server_time_ms, resets the RTC offset
-bool sendHeartbeat();
+// Batch serialisation and response parsing live in events_json.h, free of
+// Arduino headers and covered by the host tests, for the same reason the
+// signing string does: a field name that disagrees with the gateway does not
+// fail loudly, it stores the punch as malformed. What remains here is the
+// part that genuinely needs the hardware.
 
-uint32_t g_backoffMs = kBackoffMinMs;
+// handleClockSkew turns a 401 into a correction instead of a lockout.
+//
+// Signing needs a roughly-correct clock, and a dead RTC battery is exactly
+// what breaks that — so the gateway returns its own time with the rejection.
+// We adopt it as an offset rather than trusting the RTC, and mark the clock
+// usable so the retry signs inside the window.
+void handleClockSkew(const String& problemResponse) {
+  int64_t serverMs = 0;
+  if (!presence::parseJsonInt(problemResponse.c_str(), "server_time_ms", &serverMs)) {
+    // A 401 without a server clock is a real auth failure (wrong secret,
+    // revoked device), not a skew we can correct. Retrying cannot help.
+    return;
+  }
+
+  const int64_t rtcMs = static_cast<int64_t>(g_rtc.now().unixtime()) * 1000;
+  g_rtcOffsetMs = serverMs - rtcMs;
+  g_rtcTrusted = true;
+
+  // Persist the offset so a reboot does not have to earn another 401 to
+  // rediscover it.
+  g_nvs.putLong64("rtc_offset", g_rtcOffsetMs);
+
+  // Once the drift is beyond a minute the RTC itself is wrong, not merely
+  // unsynchronised; write it back so buffered punches taken before the next
+  // successful upload carry a sane timestamp.
+  if (g_rtcOffsetMs > 60'000 || g_rtcOffsetMs < -60'000) {
+    g_rtc.adjust(DateTime(static_cast<uint32_t>(serverMs / 1000)));
+    g_rtcOffsetMs = 0;
+    g_nvs.putLong64("rtc_offset", 0);
+  }
+}
+
+// sendHeartbeat reports telemetry and reads back VERSION COUNTERS, not data.
+// The device compares them against what it holds and fetches a delta only
+// when one actually moves, which is what keeps a 60-second poll small enough
+// to run over a school's uplink.
+bool sendHeartbeat() {
+  std::string body = "{\"firmware_version\":\"";
+  body += kFirmwareVersion;
+  body += "\",\"uptime_ms\":";
+  body += presence::jsonInt(static_cast<int64_t>(esp_timer_get_time() / 1000));
+  body += ",\"buffer_depth\":";
+  body += presence::jsonInt(static_cast<int64_t>(g_buffer->depth()));
+  body += ",\"last_seq\":";
+  body += presence::jsonInt(static_cast<int64_t>(g_seq));
+  body += ",\"rssi\":";
+  body += presence::jsonInt(WiFi.RSSI());
+  body += ",\"free_heap\":";
+  body += presence::jsonInt(static_cast<int64_t>(ESP.getFreeHeap()));
+  body += ",\"sensor_ok\":";
+  body += g_finger.verifyPassword() ? "true" : "false";
+  body += ",\"rtc_ok\":";
+  body += g_rtcTrusted ? "true" : "false";
+  body += "}";
+
+  String resp;
+  const int code = signedPost("/v1/device/heartbeat", body, &resp);
+  if (code == 401) {
+    handleClockSkew(resp);
+    return false;
+  }
+  if (code != 200) return false;
+
+  int64_t v = 0;
+  if (presence::parseJsonInt(resp.c_str(), "server_time_ms", &v) && !g_rtcTrusted) {
+    // First contact after a cold boot with a dead RTC: adopt the server's
+    // clock here rather than waiting for a punch to be rejected.
+    g_rtc.adjust(DateTime(static_cast<uint32_t>(v / 1000)));
+    g_rtcOffsetMs = 0;
+    g_rtcTrusted = true;
+  }
+
+  // The server can shed a reconnect herd: when a site's power returns and
+  // forty terminals come back at once, it asks them to spread out.
+  if (presence::parseJsonInt(resp.c_str(), "backoff_s", &v) && v > 0) {
+    g_backoffMs = static_cast<uint32_t>(v) * 1000;
+  }
+  if (presence::parseJsonInt(resp.c_str(), "commands_pending", &v) && v > 0) {
+    // Command handling is not built yet. Recording the count keeps the
+    // heartbeat honest rather than pretending nothing is queued.
+    log_i("commands pending: %lld", static_cast<long long>(v));
+  }
+  return true;
+}
 
 void resetBackoff() { g_backoffMs = kBackoffMinMs; }
 
@@ -271,7 +372,12 @@ bool flushEvents() {
   const size_t n = g_buffer->peek(batch, kMaxBatch);
   if (n == 0) return true;
 
-  const std::string body = buildEventsJson(batch, n);  // see events_json.cpp
+  const presence::BatchMeta meta{
+      randomUuid(),
+      static_cast<uint64_t>(esp_timer_get_time() / 1000),
+      g_buffer->depth(),
+  };
+  const std::string body = presence::buildEventsJson(batch, n, meta);
   String resp;
   const int code = signedPost("/v1/device/events", body, &resp);
 
@@ -284,7 +390,10 @@ bool flushEvents() {
   }
   if (code != 200) return false;
 
-  const int64_t ack = parseAckThrough(resp);
+  // -1 means the response carried no ack at all. Truncating on that would
+  // drop punches the server never confirmed, so treat it as a failed flush.
+  const int64_t ack = presence::parseAckThrough(resp.c_str());
+  if (ack < 0) return false;
   if (ack > 0) g_buffer->ackThrough(static_cast<uint64_t>(ack));
   return true;
 }
@@ -337,6 +446,10 @@ void setup() {
   // gateway reconstructs wall time from the delta at upload, flagging them
   // low-confidence for review rather than discarding them.
   g_rtcTrusted = g_rtc.begin() && !g_rtc.lostPower();
+
+  // Restore the correction learned from the last clock_skew rejection, so a
+  // reboot does not have to earn another 401 to rediscover it.
+  g_rtcOffsetMs = g_nvs.getLong64("rtc_offset", 0);
 
   g_feedbackQueue = xQueueCreate(8, sizeof(uint8_t));
   // g_buffer = new presence::RingBuffer(new LittleFsStorage(...));

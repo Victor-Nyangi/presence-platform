@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/canonical.h"
+#include "../src/events_json.h"
 #include "../src/ring_buffer.h"
 
 using namespace presence;
@@ -231,6 +232,166 @@ static void testCursorsSurviveReboot() {
   check(n == 2 && out[0].seq == 2, "resumes at the right sequence");
 }
 
+// ---------------------------------------------------------------------
+// Batch serialisation and response parsing (events_json.h)
+//
+// This is protocol-critical: a field name or enum spelling that disagrees
+// with the gateway's model.go does not fail loudly, it stores the punch as
+// malformed. So the wire shape is pinned here rather than trusted.
+// ---------------------------------------------------------------------
+
+static bool contains(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+static PunchRecord fingerprintRecord(uint64_t seq, uint64_t epochMs, uint16_t slot) {
+  PunchRecord r{};
+  r.seq = seq;
+  r.capturedEpochMs = epochMs;
+  r.capturedUptimeMs = 120'000;
+  r.slotNo = slot;
+  r.matchScore = 180;
+  r.credentialKind = 0;  // fingerprint
+  r.timeSource = 0;      // rtc_synced
+  r.directionHint = 1;   // in
+  for (int i = 0; i < 16; i++) r.uuid[i] = static_cast<uint8_t>(i + 1);
+  return r;
+}
+
+static void testRfc3339Formatting() {
+  printf("rfc3339 formatting\n");
+  check(formatRfc3339Utc(0) == "1970-01-01T00:00:00.000Z", "epoch");
+  check(formatRfc3339Utc(1755500000000LL) == "2025-08-18T06:53:20.000Z", "a known instant");
+  // 2024 is a leap year; 2100 is not, despite being divisible by 4. A
+  // hand-rolled calendar that gets either wrong misdates every punch after it.
+  check(formatRfc3339Utc(1709164800000LL) == "2024-02-29T00:00:00.000Z", "leap day");
+  check(formatRfc3339Utc(1709251199000LL) == "2024-02-29T23:59:59.000Z", "last second of a leap day");
+  check(formatRfc3339Utc(946684800000LL) == "2000-01-01T00:00:00.000Z", "leap century");
+  check(formatRfc3339Utc(4102444800000LL) == "2100-01-01T00:00:00.000Z", "non-leap century");
+  check(formatRfc3339Utc(1755500000123LL) == "2025-08-18T06:53:20.123Z", "milliseconds are preserved");
+}
+
+static void testUuidFormatting() {
+  printf("uuid formatting\n");
+  uint8_t raw[16];
+  for (int i = 0; i < 16; i++) raw[i] = static_cast<uint8_t>(i + 1);
+  check(formatUuid(raw) == "01020304-0506-0708-090a-0b0c0d0e0f10", "8-4-4-4-12 lowercase hex");
+}
+
+static void testBatchWireShape() {
+  printf("events batch wire shape\n");
+  const PunchRecord rec = fingerprintRecord(7, 1755500000000LL, 42);
+  BatchMeta meta{"1d1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8", 300'000, 3};
+  const std::string body = buildEventsJson(&rec, 1, meta);
+
+  check(contains(body, "\"request_id\":\"1d1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8\""), "request_id");
+  // device_uptime_ms is what lets the gateway rebuild wall time for a punch
+  // taken with a dead RTC. Omitting it silently downgrades those events.
+  check(contains(body, "\"device_uptime_ms\":300000"), "device_uptime_ms");
+  check(contains(body, "\"buffer_depth\":3"), "buffer_depth");
+  check(contains(body, "\"seq\":7"), "seq");
+  check(contains(body, "\"event_uuid\":\"01020304-0506-0708-090a-0b0c0d0e0f10\""), "event_uuid");
+  check(contains(body, "\"captured_at\":\"2025-08-18T06:53:20.000Z\""), "captured_at");
+  check(contains(body, "\"captured_uptime_ms\":120000"), "captured_uptime_ms");
+  check(contains(body, "\"time_source\":\"rtc_synced\""), "time_source");
+  check(contains(body, "\"credential_kind\":\"fingerprint\""), "credential_kind");
+  check(contains(body, "\"slot_no\":42"), "slot_no");
+  check(contains(body, "\"match_score\":180"), "match_score");
+  check(contains(body, "\"direction_hint\":\"in\""), "direction_hint");
+  check(body.front() == '{' && body.back() == '}', "is a JSON object");
+}
+
+static void testEnumMappings() {
+  printf("enum code to wire string\n");
+  PunchRecord r = fingerprintRecord(1, 1755500000000LL, 5);
+
+  r.timeSource = 1;
+  check(contains(buildEventsJson(&r, 1, BatchMeta{"r", 1, 0}), "\"time_source\":\"rtc_unsynced\""), "rtc_unsynced");
+  r.timeSource = 2;
+  check(contains(buildEventsJson(&r, 1, BatchMeta{"r", 1, 0}), "\"time_source\":\"uptime_only\""), "uptime_only");
+
+  r.timeSource = 0;
+  r.directionHint = 0;
+  check(contains(buildEventsJson(&r, 1, BatchMeta{"r", 1, 0}), "\"direction_hint\":\"unknown\""), "direction unknown");
+  r.directionHint = 2;
+  check(contains(buildEventsJson(&r, 1, BatchMeta{"r", 1, 0}), "\"direction_hint\":\"out\""), "direction out");
+
+  const char* kinds[] = {"fingerprint", "rfid_card", "nfc_tag", "pin", "qr"};
+  bool allOk = true;
+  for (uint8_t k = 0; k < 5; k++) {
+    r.credentialKind = k;
+    const std::string want = std::string("\"credential_kind\":\"") + kinds[k] + "\"";
+    if (!contains(buildEventsJson(&r, 1, BatchMeta{"r", 1, 0}), want)) allOk = false;
+  }
+  check(allOk, "all five credential kinds map to the schema's enum spellings");
+}
+
+static void testDeadRtcOmitsCapturedAt() {
+  printf("dead RTC\n");
+  // capturedEpochMs == 0 means the RTC was never set. Emitting
+  // 1970-01-01 would record a 56-year clock skew; omitting the key lets Go
+  // decode a zero time.Time, which store.insertEvent replaces with the
+  // effective time it reconstructs from the uptime delta.
+  PunchRecord r = fingerprintRecord(1, 0, 42);
+  r.timeSource = 2;
+  const std::string body = buildEventsJson(&r, 1, BatchMeta{"r", 500'000, 1});
+  check(!contains(body, "captured_at"), "captured_at is omitted entirely");
+  check(!contains(body, "1970"), "no epoch-zero timestamp leaks into the payload");
+  check(contains(body, "\"captured_uptime_ms\":120000"), "uptime is still sent");
+  check(contains(body, "\"device_uptime_ms\":500000"), "upload uptime is still sent");
+}
+
+static void testMultipleEvents() {
+  printf("batching\n");
+  PunchRecord recs[3];
+  for (int i = 0; i < 3; i++) recs[i] = fingerprintRecord(static_cast<uint64_t>(i + 1), 1755500000000LL, 42);
+  const std::string body = buildEventsJson(recs, 3, BatchMeta{"r", 1, 3});
+  check(contains(body, "\"seq\":1") && contains(body, "\"seq\":2") && contains(body, "\"seq\":3"), "all three present");
+  check(!contains(body, ",]") && !contains(body, "[,"), "no malformed array separators");
+  size_t braces = 0;
+  for (char c : body) {
+    if (c == '{') braces++;
+    if (c == '}') braces--;
+  }
+  check(braces == 0, "braces balance");
+}
+
+static void testZeroEventsIsStillValidJson() {
+  printf("empty batch\n");
+  const std::string body = buildEventsJson(nullptr, 0, BatchMeta{"r", 1, 0});
+  check(contains(body, "\"events\":[]"), "empty array rather than null");
+}
+
+static void testAckParsing() {
+  printf("ack_through parsing\n");
+  const char* ok = "{\"ack_through\":42,\"accepted\":[41,42],\"duplicates\":[],\"rejected\":[],\"server_time_ms\":1755500000000}";
+  check(parseAckThrough(ok) == 42, "reads the value");
+
+  // A rejected event still advances the ack, because it is still stored.
+  // Refusing to truncate here is what wedges a buffer behind a poison event.
+  const char* rejected = "{\"ack_through\":9,\"accepted\":[],\"duplicates\":[],\"rejected\":[{\"seq\":9,\"reason\":\"unknown_slot\"}]}";
+  check(parseAckThrough(rejected) == 9, "advances past a rejected event");
+
+  check(parseAckThrough("{\"accepted\":[]}") == -1, "absent key reports -1, never 0");
+  check(parseAckThrough("") == -1, "empty body reports -1");
+  check(parseAckThrough("{\"ack_through\":0}") == 0, "an explicit zero is not confused with absence");
+
+  // "ack_through" must not be matched inside some other key's name or value.
+  check(parseAckThrough("{\"last_ack_through_seen\":5,\"ack_through\":8}") == 8, "matches the whole key only");
+  check(parseAckThrough("{\"note\":\"ack_through\",\"ack_through\":3}") == 3, "ignores the name appearing as a value");
+}
+
+static void testServerTimeParsingForClockSkew() {
+  printf("clock skew recovery\n");
+  // A 401 carries the server's clock so a terminal with a dead RTC can
+  // correct itself and retry rather than being locked out forever.
+  const char* problem = "{\"title\":\"Unauthorized\",\"status\":401,\"code\":\"clock_skew\","
+                        "\"detail\":\"timestamp outside accepted window\",\"server_time_ms\":1755500000000}";
+  int64_t out = 0;
+  check(parseJsonInt(problem, "server_time_ms", &out) && out == 1755500000000LL, "server_time_ms recovered from a 401");
+  check(!parseJsonInt("{\"status\":401}", "server_time_ms", &out), "missing key reports failure");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -241,6 +402,15 @@ int main() {
   testFailedWriteIsReported();
   testOverflowDropsOldest();
   testCursorsSurviveReboot();
+  testRfc3339Formatting();
+  testUuidFormatting();
+  testBatchWireShape();
+  testEnumMappings();
+  testDeadRtcOmitsCapturedAt();
+  testMultipleEvents();
+  testZeroEventsIsStillValidJson();
+  testAckParsing();
+  testServerTimeParsingForClockSkew();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;
