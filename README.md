@@ -31,12 +31,45 @@ firmware/   ESP32 / PlatformIO terminal
 
 ```bash
 cd gateway && go mod tidy && cd ..   # generates go.sum (not committed) on first checkout
-docker compose up -d postgres
+docker compose up -d postgres        # binds host port 5432; see below if that is taken
+make seed             # create the bench fixture, print the device secret
 make db-load          # apply schema, run invariant tests
 make test             # gateway unit tests + firmware host tests
 make test-integration # gateway against real Postgres
 make run              # start the gateway on :8080
 ```
+
+### Getting a device onto the bench
+
+`POST /v1/device/provision` is deliberately a 501 until the installer flow
+exists, so a terminal has no way to obtain a secret on its own. `make seed`
+fills that gap: it writes the fixture — one school, two people, one active
+terminal with both fingerprint slots bound — and prints the device secret
+once.
+
+```
+DEVICE_SECRET  90fc1acc7e787daf65860a3869f62f7a63aa321f5f1859cb4b6a4486e7a7abca
+key_version    1
+```
+
+The row stores only ciphertext, sealed under your KEK with the device id as
+additional data, so that printout is the only time you see the raw key. Paste
+it into the terminal's NVS. `make seed RESET=1` reissues it — that tears down
+the fixture, and because `punch_event` is append-only by trigger, the teardown
+has to disable that trigger to clear the device's history. It is a bench tool;
+do not point it at anything holding real attendance data.
+
+Two things that will waste an afternoon otherwise:
+
+- **Slot bindings are backdated a year on purpose.** Resolution happens as of
+  an event's effective time, so a binding starting at "now" rejects every
+  punch older than "now" — including anything a device uploads from a buffer
+  it filled earlier, and every event whose time was rebuilt from an uptime
+  delta. Those all present as `unknown_slot`, which reads like a signing
+  fault and is not one.
+- **`docker compose up postgres` binds host port 5432**, which collides with a
+  system Postgres install. Either stop yours, or run Postgres on another port
+  and pass `DB_URL=...` / `-db` to the make targets.
 
 ## The gateway
 
