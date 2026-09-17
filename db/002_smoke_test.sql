@@ -176,4 +176,48 @@ EXCEPTION WHEN check_violation THEN
     RAISE NOTICE 'TEST 7b E.164 validation: PASS';
 END $$;
 
+-- TEST 8 -------------------------------------------------------------
+-- outbox_event subject must be either a business day OR a span's anchoring
+-- punch event(s), never both, never neither. This is what stops the table
+-- from silently accepting an event nobody can route back to a subject.
+INSERT INTO outbox_event (org_id, event_type, person_id, business_date, payload)
+VALUES ('11111111-1111-1111-1111-111111111111', 'attendance_day.upserted',
+        '44444444-4444-4444-4444-444444444444', '2026-08-18', '{"total_seconds": 30660}');
+
+INSERT INTO outbox_event (org_id, event_type, person_id, in_event_id, payload)
+SELECT '11111111-1111-1111-1111-111111111111', 'attendance_span.upserted',
+       '44444444-4444-4444-4444-444444444444', id, '{"duration_seconds": 30660}'
+FROM punch_event WHERE device_seq = 1001;
+
+DO $$
+DECLARE n integer; s outbox_status;
+BEGIN
+    SELECT count(*) INTO n FROM outbox_event;
+    ASSERT n = 2, format('TEST 8 FAILED: expected 2 outbox rows, got %s', n);
+    SELECT status INTO s FROM outbox_event WHERE event_type = 'attendance_day.upserted';
+    ASSERT s = 'pending', format('TEST 8 FAILED: default status was %s, want pending', s);
+    RAISE NOTICE 'TEST 8a outbox rows accepted, default status pending: PASS';
+END $$;
+
+DO $$
+BEGIN
+    INSERT INTO outbox_event (org_id, event_type, person_id, business_date, in_event_id, payload)
+    SELECT '11111111-1111-1111-1111-111111111111', 'attendance_span.upserted',
+           '44444444-4444-4444-4444-444444444444', '2026-08-18', id, '{}'
+    FROM punch_event WHERE device_seq = 1001;
+    RAISE EXCEPTION 'TEST 8 FAILED: an event with BOTH a business_date and an in_event_id was accepted';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'TEST 8b outbox subject cannot be both day and span: PASS';
+END $$;
+
+DO $$
+BEGIN
+    INSERT INTO outbox_event (org_id, event_type, person_id, payload)
+    VALUES ('11111111-1111-1111-1111-111111111111', 'attendance_day.upserted',
+            '44444444-4444-4444-4444-444444444444', '{}');
+    RAISE EXCEPTION 'TEST 8 FAILED: an event with NEITHER a business_date nor a span event id was accepted';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'TEST 8c outbox subject cannot be empty: PASS';
+END $$;
+
 ROLLBACK;
