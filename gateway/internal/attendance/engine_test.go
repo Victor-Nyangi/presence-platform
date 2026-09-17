@@ -4,6 +4,7 @@ package attendance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -140,6 +141,13 @@ func TestRecomputeIsIdempotent(t *testing.T) {
 	second := f.recompute(t, 18, 18)
 	third := f.recompute(t, 18, 18)
 
+	// Events is deliberately excluded from the idempotency comparison: the
+	// projector diffs old state against new, so the first run (nothing
+	// existed before) emits events and identical re-runs emit none. That is
+	// the whole point of diffing rather than emitting on every write — a
+	// cron re-run over an unchanged window must not re-send the same
+	// attendance events every time it fires.
+	first.Events, second.Events, third.Events = 0, 0, 0
 	if first != second || second != third {
 		t.Fatalf("not idempotent: %+v / %+v / %+v", first, second, third)
 	}
@@ -418,6 +426,156 @@ func TestReviewQueueSurfacesProblemDays(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("anomalies = %v, want missing_out", items[0].Anomalies)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Outbox: end-to-end against real Postgres. projector_test.go covers the
+// pure diff logic exhaustively without a database; these confirm the wiring
+// into Recompute's actual transaction behaves the same way for real.
+// ---------------------------------------------------------------------
+
+func (f *fixture) outboxEvents(t *testing.T) []struct {
+	EventType string
+	Payload   []byte
+} {
+	t.Helper()
+	rows, err := f.pool.Query(context.Background(),
+		`SELECT event_type, payload FROM outbox_event ORDER BY created_at, event_type`)
+	if err != nil {
+		t.Fatalf("query outbox: %v", err)
+	}
+	defer rows.Close()
+	var out []struct {
+		EventType string
+		Payload   []byte
+	}
+	for rows.Next() {
+		var r struct {
+			EventType string
+			Payload   []byte
+		}
+		if err := rows.Scan(&r.EventType, &r.Payload); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func TestRecomputeWritesOutboxEventsForNewSpansAndDay(t *testing.T) {
+	f := setup(t)
+	f.punch(t, ashaID, f.at(18, 8, 0), DirIn)
+	f.punch(t, ashaID, f.at(18, 17, 0), DirOut)
+
+	res := f.recompute(t, 18, 18)
+	if res.Events != 2 {
+		t.Fatalf("Events = %d, want 2 (1 span upsert + 1 day upsert)", res.Events)
+	}
+
+	events := f.outboxEvents(t)
+	if len(events) != 2 {
+		t.Fatalf("outbox has %d rows, want 2", len(events))
+	}
+	var sawSpan, sawDay bool
+	for _, e := range events {
+		switch e.EventType {
+		case EventSpanUpserted:
+			sawSpan = true
+		case EventDayUpserted:
+			sawDay = true
+			// jsonb round-trips through Postgres with its own text
+			// formatting (spaces after ':' and ','), so parse rather than
+			// substring-match the raw bytes.
+			var payload dayEventPayload
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				t.Fatalf("day payload did not unmarshal: %v", err)
+			}
+			if payload.Data == nil || payload.Data.TotalSeconds != 32400 {
+				t.Errorf("day payload total_seconds = %+v, want 32400", payload.Data)
+			}
+		}
+	}
+	if !sawSpan || !sawDay {
+		t.Errorf("expected one of each event type, got types: %+v", events)
+	}
+
+	// A default-status row is what the delivery worker picks up.
+	var pending int
+	f.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM outbox_event WHERE status = 'pending'`).Scan(&pending)
+	if pending != 2 {
+		t.Errorf("pending outbox rows = %d, want 2", pending)
+	}
+}
+
+// The core diff property, verified against real Postgres rather than just
+// the pure DiffSpans/DiffDays unit tests: a re-run over an unchanged window
+// must not re-emit events, and a re-run that follows a real state change
+// (an amendment) must emit exactly the events for what actually changed.
+func TestRecomputeOnlyEmitsForActualChanges(t *testing.T) {
+	f := setup(t)
+	f.punch(t, ashaID, f.at(18, 8, 0), DirIn)
+	badID := f.punch(t, ashaID, f.at(18, 17, 0), DirIn) // should be 'out'
+
+	first := f.recompute(t, 18, 18)
+	if first.Events == 0 {
+		t.Fatal("first recompute over new data must emit events")
+	}
+
+	noop := f.recompute(t, 18, 18)
+	if noop.Events != 0 {
+		t.Errorf("an unchanged re-run emitted %d events, want 0", noop.Events)
+	}
+
+	if _, err := f.pool.Exec(context.Background(), `
+		INSERT INTO punch_amendment (punch_event_id, new_direction, reason)
+		VALUES ($1,'out','reader was mounted at the exit')`, badID); err != nil {
+		t.Fatalf("amend: %v", err)
+	}
+	corrected := f.recompute(t, 18, 18)
+	if corrected.Events == 0 {
+		t.Error("a real state change (the amendment) must emit at least one event")
+	}
+}
+
+// The transactional-outbox guarantee: outbox rows are written in the same
+// transaction as the attendance rows they describe, so a rollback discards
+// both together. Exercised directly at the transaction level rather than by
+// forcing Recompute itself to fail partway — Recompute has no seam to
+// inject a mid-transaction failure into without changing its signature for
+// tests alone, and this proves the property that actually matters: nothing
+// commits attendance state without also committing (or discarding) its
+// outbox row atomically.
+func TestOutboxWritesAreTransactionalWithAttendanceWrites(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO attendance_span (org_id, person_id, business_date, started_at, ended_at)
+		VALUES ($1,$2,'2026-08-18','2026-08-18T08:00:00Z','2026-08-18T17:00:00Z')`,
+		orgID, ashaID); err != nil {
+		t.Fatalf("insert span: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_event (id, org_id, event_type, person_id, business_date, payload)
+		VALUES (gen_random_uuid(),$1,'attendance_day.upserted',$2,'2026-08-18','{}')`,
+		orgID, ashaID); err != nil {
+		t.Fatalf("insert outbox: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var spans, events int
+	f.pool.QueryRow(ctx, `SELECT count(*) FROM attendance_span`).Scan(&spans)
+	f.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_event`).Scan(&events)
+	if spans != 0 || events != 0 {
+		t.Fatalf("rollback must discard both: spans=%d outbox_events=%d, want 0 and 0", spans, events)
 	}
 }
 

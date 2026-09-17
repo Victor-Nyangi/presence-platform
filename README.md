@@ -126,6 +126,22 @@ The rules that matter, and why:
 
 Corrections are additive `punch_amendment` rows, never edits — the raw event is immutable. Later amendment wins, per field.
 
+## The outbound event emitter
+
+Nothing downstream should read this database directly. `internal/attendance.Engine.Recompute` doubles as a **projector**: in the same transaction that rewrites `attendance_span`/`attendance_day`, it diffs the old state against the new and writes one `outbox_event` row per subject that actually changed — a routine cron re-run over an unchanged window emits nothing. `cmd/deliver` is a separate long-running process that drains the outbox and pushes signed events to one configured downstream consumer, at-least-once, with retry/backoff and a dead-letter path.
+
+```bash
+deliver   # PRESENCE_EMITTER_ENDPOINT_URL, _SIGNING_SECRET, _KEY_ID required — see .env.example
+```
+
+Full contract (payload shapes, headers, retry/ordering guarantees): [`docs/events.md`](docs/events.md). The short version:
+
+- **Two event families**, matching the two derived tables: `attendance_span.{upserted,removed}` and `attendance_day.{upserted,removed}`. No occupancy events — there is no device-to-room/department mapping in this schema (devices map to a `site`, nothing finer), and inventing one was out of scope.
+- **Full snapshot per event, not a delta.** A consumer upserts by subject key if the incoming `emitted_at` is newer than the last one it applied. That single property is what makes at-least-once delivery, retries, and a dead-lettered event all safe without extra machinery: a dead event is superseded for free the next time that subject's state changes.
+- **Spans are keyed by `in_event_id`/`out_event_id`, not `attendance_span.id`.** The latter is a `bigserial` that churns on every recompute — the engine deletes and re-inserts the whole window unconditionally. `punch_event` rows are append-only and never deleted, so the punch ids that anchor a span are the only identifiers that stay stable across recomputes.
+- **HMAC-SHA256 signed**, Stripe/GitHub-shaped (`X-Presence-Signature: t=<unix_ms>,v1=<hex hmac>`), plus `X-Presence-Event-Id` as the idempotency key a consumer de-duplicates on.
+- **HTTPS required outside local development.** These payloads are attendance records about identified people; HMAC gives origin and integrity, not confidentiality. `PRESENCE_EMITTER_ALLOW_INSECURE_HTTP=true` is a loud, explicit opt-out, not a default.
+
 ## The firmware
 
 Two FreeRTOS tasks, and one rule: **the scan loop never blocks on the network.** Core 1 scans, buffers and beeps; core 0 drains the buffer whenever it can.
@@ -166,6 +182,7 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 - [ ] Firmware: LittleFS `Storage` implementation — until this exists `g_buffer` is null and the terminal cannot run
 - [ ] Firmware: first build with the ESP32 toolchain, then first run on hardware
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
+- [x] Outbound event emitter: projector, transactional outbox, signed delivery worker — see [`docs/events.md`](docs/events.md)
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
 - [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to
 - [ ] Admin UI over the review queue

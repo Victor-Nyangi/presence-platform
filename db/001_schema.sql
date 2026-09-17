@@ -36,6 +36,7 @@ CREATE TYPE command_kind      AS ENUM (
 CREATE TYPE command_status    AS ENUM ('queued', 'delivered', 'succeeded', 'failed', 'expired');
 CREATE TYPE notify_channel    AS ENUM ('sms', 'whatsapp', 'email', 'push');
 CREATE TYPE notify_status     AS ENUM ('pending', 'sent', 'delivered', 'failed', 'suppressed');
+CREATE TYPE outbox_status     AS ENUM ('pending', 'delivering', 'delivered', 'dead');
 
 -- ---------------------------------------------------------------------
 -- Tenancy
@@ -463,6 +464,71 @@ CREATE UNIQUE INDEX notification_dedupe_idx ON notification (org_id, dedupe_key)
     WHERE dedupe_key IS NOT NULL;
 CREATE INDEX notification_due_idx ON notification (scheduled_for)
     WHERE status = 'pending';
+
+-- ---------------------------------------------------------------------
+-- Outbound event outbox (projector -> delivery worker)
+--
+-- Deliberately NOT the `notification` table above. `notification` is
+-- guardian-messaging shaped: a channel enum of sms/whatsapp/email/push, a
+-- free-text body, and a dedupe_key that COLLAPSES duplicates ("one arrival
+-- SMS per child per day"). This table is system-integration shaped: a
+-- structured JSON payload, retry/backoff state, and a per-row UUID that
+-- consumers use to DETECT duplicates rather than have them collapsed away
+-- (at-least-once delivery means the same event can legitimately arrive
+-- twice; that is the consumer's problem to de-duplicate, not ours to hide).
+-- Bolting this onto `notification` would corrupt its existing semantics for
+-- guardian SMS.
+--
+-- Written by internal/attendance.Engine.Recompute in the SAME transaction
+-- as the attendance_span/attendance_day rows it derives from, so an event
+-- is never emitted for a recompute that rolls back. Drained by the
+-- `deliver` binary (cmd/deliver), a separate long-running process, per
+-- cmd/gateway's own stated separation: "Attendance computation,
+-- notifications and the admin UI live in separate services."
+-- ---------------------------------------------------------------------
+
+CREATE TABLE outbox_event (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id          uuid NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    event_type      text NOT NULL,
+
+    -- Subject identity. A span event is keyed by the punch_event id(s) that
+    -- anchor it — NOT attendance_span.id, which is a bigserial that churns
+    -- on every recompute (the engine deletes and re-inserts the whole
+    -- window every run). punch_event rows are append-only and never
+    -- deleted, so in_event_id/out_event_id are the only identifiers here
+    -- that are actually stable across recomputes. A day event is keyed by
+    -- (person_id, business_date) instead, which attendance_day already
+    -- uses as its own primary key.
+    person_id       uuid REFERENCES person(id) ON DELETE SET NULL,
+    business_date   date,
+    in_event_id     bigint REFERENCES punch_event(id) ON DELETE SET NULL,
+    out_event_id    bigint REFERENCES punch_event(id) ON DELETE SET NULL,
+
+    -- The full current snapshot, not a delta. That is what lets
+    -- at-least-once delivery and out-of-order retries stay safe: a
+    -- consumer upserts by subject key if the incoming emitted_at is newer
+    -- than the last one it applied, so duplicate or reordered delivery
+    -- never corrupts its view, and a dead-lettered event is superseded for
+    -- free the next time this subject's state changes.
+    payload         jsonb NOT NULL,
+
+    status          outbox_status NOT NULL DEFAULT 'pending',
+    attempts        integer NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    last_error      text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    delivered_at    timestamptz,
+
+    CONSTRAINT outbox_event_subject CHECK (
+        (business_date IS NOT NULL AND in_event_id IS NULL AND out_event_id IS NULL)
+        OR (business_date IS NULL AND (in_event_id IS NOT NULL OR out_event_id IS NOT NULL))
+    )
+);
+
+CREATE INDEX outbox_event_due_idx ON outbox_event (next_attempt_at)
+    WHERE status = 'pending';
+CREATE INDEX outbox_event_org_idx ON outbox_event (org_id, created_at DESC);
 
 -- ---------------------------------------------------------------------
 -- Sync + audit

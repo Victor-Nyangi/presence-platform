@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 DB_URL ?= postgres://presence:presence@localhost:5432/presence?sslmode=disable
 
-.PHONY: help db-load test test-integration firmware-test run build seed fmt lint clean
+.PHONY: help db-load test test-integration firmware-test run build seed deliver fmt lint clean
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -26,10 +26,11 @@ firmware-test: ## Compile and run firmware logic tests on the host
 		firmware/test/host_test.cpp firmware/src/crc32.cpp
 	@./.build/fwtest
 
-build: ## Build the gateway, recompute and seed binaries
+build: ## Build the gateway, recompute, seed and deliver binaries
 	cd gateway && go build -o ../.build/gateway ./cmd/gateway
 	cd gateway && go build -o ../.build/recompute ./cmd/recompute
 	cd gateway && go build -o ../.build/seed ./cmd/seed
+	cd gateway && go build -o ../.build/deliver ./cmd/deliver
 
 seed: build ## Create the bench fixture and print a device secret: make seed [RESET=1]
 	./.build/seed $(if $(RESET),-reset,)
@@ -39,6 +40,9 @@ recompute: build ## Rebuild derived attendance: make recompute ORG=<uuid> DAYS=7
 
 run: build ## Run the gateway
 	./.build/gateway
+
+deliver: build ## Run the outbound event delivery worker (see docs/events.md for required env)
+	./.build/deliver
 
 fmt:
 	cd gateway && gofmt -w .

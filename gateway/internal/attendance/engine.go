@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,15 +20,20 @@ const lookbackDays = 2
 
 type Engine struct {
 	pool *pgxpool.Pool
+	now  func() time.Time // injectable for tests; stamps outbox events' emitted_at
 }
 
-func NewEngine(pool *pgxpool.Pool) *Engine { return &Engine{pool: pool} }
+func NewEngine(pool *pgxpool.Pool) *Engine { return &Engine{pool: pool, now: time.Now} }
+
+// SetClock overrides the time source. Test-only.
+func (e *Engine) SetClock(f func() time.Time) { e.now = f }
 
 type Result struct {
 	People      int
 	Days        int
 	Spans       int
 	NeedsReview int
+	Events      int // outbox rows written for consumers of the emitter
 }
 
 // Recompute rebuilds derived attendance for an organisation over a date range.
@@ -68,6 +74,21 @@ func (e *Engine) Recompute(ctx context.Context, orgID string, from, to time.Time
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Snapshot what's already there BEFORE the rewrite below, so the
+	// projector can tell what actually changed. Recompute always deletes and
+	// re-inserts the whole window regardless of whether anything changed —
+	// without this snapshot, every cron re-run would re-emit an event for
+	// every span and day in the window, even ones that recomputed
+	// byte-for-byte identical.
+	beforeSpans, err := e.loadSpanSnapshots(ctx, tx, orgID, windowStart, windowEnd)
+	if err != nil {
+		return res, fmt.Errorf("snapshot spans: %w", err)
+	}
+	beforeDays, err := e.loadDaySnapshots(ctx, tx, orgID, windowStart, windowEnd)
+	if err != nil {
+		return res, fmt.Errorf("snapshot days: %w", err)
+	}
+
 	// Clear the window first. Spans carry a unique index on in_event_id, so a
 	// re-run would otherwise collide with its own previous output.
 	if _, err := tx.Exec(ctx, `
@@ -82,6 +103,9 @@ func (e *Engine) Recompute(ctx context.Context, orgID string, from, to time.Time
 		orgID, windowStart, windowEnd); err != nil {
 		return res, fmt.Errorf("clear days: %w", err)
 	}
+
+	afterSpans := map[SpanKey]SpanSnapshot{}
+	afterDays := map[DayKey]DaySnapshot{}
 
 	for personID, punches := range byPerson {
 		spans := Pair(punches, rules)
@@ -107,6 +131,13 @@ func (e *Engine) Recompute(ctx context.Context, orgID string, from, to time.Time
 					return res, fmt.Errorf("insert span: %w", err)
 				}
 				res.Spans++
+
+				snap := SpanSnapshot{
+					PersonID: personID, InEventID: s.InEventID, OutEventID: s.OutEventID,
+					BusinessDate: date, StartedAt: s.StartedAt, EndedAt: s.EndedAt,
+					Anomalies: s.Anomalies,
+				}
+				afterSpans[snap.Key()] = snap
 			}
 
 			day := Rollup(date, daySpans, schedules.forPerson(personID, date), rules)
@@ -125,13 +156,85 @@ func (e *Engine) Recompute(ctx context.Context, orgID string, from, to time.Time
 			if day.NeedsReview {
 				res.NeedsReview++
 			}
+
+			daySnap := DaySnapshot{
+				PersonID: personID, BusinessDate: date,
+				FirstInAt: day.FirstInAt, LastOutAt: day.LastOutAt,
+				TotalSeconds: int(day.Total.Seconds()), SpanCount: day.SpanCount,
+				IsPresent: day.IsPresent, IsLate: day.IsLate, NeedsReview: day.NeedsReview,
+			}
+			afterDays[daySnap.Key()] = daySnap
 		}
 		if wrote {
 			res.People++
 		}
 	}
 
+	emittedAt := e.now()
+	events := DiffSpans(orgID, beforeSpans, afterSpans, emittedAt, NewEventID)
+	events = append(events, DiffDays(orgID, beforeDays, afterDays, emittedAt, NewEventID)...)
+	for _, ev := range events {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox_event
+				(id, org_id, event_type, person_id, business_date, in_event_id, out_event_id, payload)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			ev.EventID, orgID, ev.EventType, ev.PersonID, ev.BusinessDate, ev.InEventID, ev.OutEventID, ev.Payload,
+		); err != nil {
+			return res, fmt.Errorf("insert outbox event: %w", err)
+		}
+	}
+	res.Events = len(events)
+
 	return res, tx.Commit(ctx)
+}
+
+// loadSpanSnapshots reads the spans currently stored for the window, before
+// this recompute rewrites them. Scoped identically to the DELETE below it,
+// so "before" and "after" are directly comparable.
+func (e *Engine) loadSpanSnapshots(ctx context.Context, tx pgx.Tx, orgID string, from, to time.Time) (map[SpanKey]SpanSnapshot, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT person_id::text, in_event_id, out_event_id, business_date, started_at, ended_at, anomalies
+		FROM attendance_span
+		WHERE org_id = $1 AND business_date BETWEEN $2 AND $3`, orgID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[SpanKey]SpanSnapshot{}
+	for rows.Next() {
+		var s SpanSnapshot
+		if err := rows.Scan(&s.PersonID, &s.InEventID, &s.OutEventID, &s.BusinessDate,
+			&s.StartedAt, &s.EndedAt, &s.Anomalies); err != nil {
+			return nil, err
+		}
+		out[s.Key()] = s
+	}
+	return out, rows.Err()
+}
+
+// loadDaySnapshots is loadSpanSnapshots's counterpart for attendance_day.
+func (e *Engine) loadDaySnapshots(ctx context.Context, tx pgx.Tx, orgID string, from, to time.Time) (map[DayKey]DaySnapshot, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT person_id::text, business_date, first_in_at, last_out_at,
+		       total_s, span_count, is_present, is_late, needs_review
+		FROM attendance_day
+		WHERE org_id = $1 AND business_date BETWEEN $2 AND $3`, orgID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[DayKey]DaySnapshot{}
+	for rows.Next() {
+		var d DaySnapshot
+		if err := rows.Scan(&d.PersonID, &d.BusinessDate, &d.FirstInAt, &d.LastOutAt,
+			&d.TotalSeconds, &d.SpanCount, &d.IsPresent, &d.IsLate, &d.NeedsReview); err != nil {
+			return nil, err
+		}
+		out[d.Key()] = d
+	}
+	return out, rows.Err()
 }
 
 // anomalyArray keeps a nil slice out of a NOT NULL text[] column.
