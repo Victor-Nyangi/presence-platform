@@ -2,7 +2,7 @@
 
 Credential-agnostic presence and attendance tracking for offices, hospitals and schools. Terminals read a fingerprint (or a card, or a PIN) and record *who was here, when* — reliably, including while the network is down.
 
-> **Status: early.** The gateway and schema are built and tested. The firmware's protocol-critical logic — ring buffer, signing string, batch serialisation, response parsing — is covered by host tests, and the batch payload it produces has been checked against the real gateway. It still will not run on a board: `setup()` never constructs the ring buffer, because the LittleFS-backed `Storage` implementation does not exist yet, and none of the code has been built with the ESP32 toolchain.
+> **Status: early.** The gateway and schema are built and tested. The firmware's protocol-critical logic — ring buffer, signing string, batch serialisation, response parsing — is covered by host tests, and the batch payload it produces has been checked against the real gateway. `setup()` now constructs the LittleFS-backed buffer, and the firmware builds with the ESP32 toolchain (first build 2026-10-11, see [`docs/firmware-build.md`](docs/firmware-build.md)). It has never run on a board, and host emulation says the buffer as sized faults on the first punch — see *First ESP32 build* below.
 
 ## Why this exists
 
@@ -162,6 +162,15 @@ make firmware-test
 
 This covers the ring buffer (ack semantics, power-cut corruption, overflow, reboot recovery) and the canonical signing string. The signing format is pinned by the **same golden vector** in both `gateway/internal/auth/conformance_test.go` and `firmware/test/host_test.cpp` — if someone changes the format on one side only, CI fails instead of every deployed terminal returning 401 the morning after a release.
 
+### First ESP32 build
+
+Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings and no source changes. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
+
+- **Size:** 746,909 B flash (38.0% of the app slot), 39,812 B static RAM (12.1%).
+- **OTA slack:** 1,217,632 B free in the 1,966,080 B OTA slot (61.9%). Under `default.csv` it would be 562,272 B (42.9%).
+- **Buffer, computed:** `ringCapacityBytes` would give **1,911 records** under `min_spiffs` and 23,756 under `default`. This is an estimate: only the boot line on a board is authoritative.
+- **Buffer, usable:** an estimate from emulation, not yet seen on hardware. littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks. At the computed size, the first `append()` therefore fails with `LFS_ERR_NOSPC` and the terminal goes to `Fault`. A ring only works up to about half the filesystem: 1,022 records under `min_spiffs`, 11,923 under `default`, at ~8 block erases per punch. How to fix it is an open design decision.
+
 ### Bill of materials (prototype)
 
 | Part | Note |
@@ -179,8 +188,9 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 - [x] Gateway: signing, idempotent ingest, commands, roster
 - [x] Firmware: buffer + signing logic, host-tested
 - [x] Firmware: batch serialisation + response parsing, host-tested against the gateway
-- [ ] Firmware: LittleFS `Storage` implementation — until this exists `g_buffer` is null and the terminal cannot run
-- [ ] Firmware: first build with the ESP32 toolchain, then first run on hardware
+- [ ] Firmware: LittleFS `Storage` implementation — built, but emulation says the computed ring size cannot be rewritten in place (see *First ESP32 build*)
+- [x] Firmware: first build with the ESP32 toolchain (2026-10-11)
+- [ ] Firmware: first run on hardware
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
 - [x] Outbound event emitter: projector, transactional outbox, signed delivery worker — see [`docs/events.md`](docs/events.md)
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
