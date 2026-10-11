@@ -55,29 +55,83 @@ class Storage {
   virtual bool loadCursors(uint64_t* head, uint64_t* tail) = 0;
 };
 
-// ringCapacityBytes decides how large the ring file should be, given what
-// the filesystem reports. Sizing at runtime rather than hard-coding a number
+// littlefs stores a file as a CTZ skip-list: block n (n >= 1) starts with
+// ctz(n)+1 four-byte back-pointers. Summed over a file that is fewer than two
+// pointers per block, so 8 bytes per block is a strict upper bound on the
+// overhead and blockSize - 8 a strict lower bound on the data a block holds.
+static const size_t kLfsCtzOverheadPerBlock = 8;
+
+// ringCapacityBytes decides how large the ring file should be, given the
+// filesystem's geometry. Sizing at runtime rather than hard-coding a number
 // means that enlarging the LittleFS partition later grows the buffer with no
 // code change -- which matters, because the partition table is the binding
 // constraint on how long an outage the terminal can ride out, not the flash
 // size.
 //
+// Why the ring gets only about half the filesystem: littlefs is
+// copy-on-write. A write at offset X re-copies the file from the block
+// holding X to end-of-file into freshly allocated blocks, and frees the old
+// ones only once the new copy is committed. An append at offset 0 therefore
+// needs a whole file's worth of FREE blocks on top of the blocks the file
+// already occupies. So, in blocks:
+//
+//     ring + ring + metadata + slack <= blockCount
+//     ring = (blockCount - metadata - slack) / 2
+//
+// metadata is everything on the filesystem that is not this ring file (the
+// superblock/root-directory pair on a fresh partition), taken from usedBytes
+// rather than assumed. slack is spare blocks for littlefs to relocate a
+// worn metadata pair mid-commit, while both copies of the file are live.
+// The byte capacity is then ring blocks at (blockSize - 8) bytes each,
+// rounded down to whole records, so the file never spills into one block
+// more than was budgeted for it.
+//
+// Sizing at all of the free space instead (the obvious formula) preallocates
+// fine and then fails the first append with LFS_ERR_NOSPC; see
+// docs/firmware-build.md and firmware/tools/littlefs_ring_sim.py.
+//
 // existingRingBytes is added back because usedBytes already counts the ring
-// file we are about to reopen. Leaving it out shrinks the buffer to nothing
-// on the second boot.
+// file we are about to replace. It is reclaimed as floor(bytes / blockSize)
+// blocks, which never exceeds what the file really occupies, so a stale
+// file can only make the new ring smaller, never too big.
 //
 // Returns 0 when the partition cannot hold minRecords, so the caller can
 // fault loudly at startup instead of booting with a buffer too small to
 // cover an outage.
-inline size_t ringCapacityBytes(size_t totalBytes, size_t usedBytes,
-                                size_t existingRingBytes, size_t reserveBytes,
-                                size_t minRecords) {
-  if (usedBytes > totalBytes) return 0;
-  const size_t available = (totalBytes - usedBytes) + existingRingBytes;
-  if (available <= reserveBytes) return 0;
-  const size_t records = (available - reserveBytes) / sizeof(PunchRecord);
-  if (records < minRecords) return 0;
+inline size_t ringCapacityBytes(size_t blockSize, size_t blockCount,
+                                size_t usedBytes, size_t existingRingBytes,
+                                size_t slackBlocks, size_t minRecords) {
+  if (blockSize <= kLfsCtzOverheadPerBlock || blockCount == 0) return 0;
+  const size_t usedBlocks = (usedBytes + blockSize - 1) / blockSize;
+  if (usedBlocks > blockCount) return 0;
+  size_t reclaim = existingRingBytes / blockSize;
+  if (reclaim > usedBlocks) reclaim = usedBlocks;
+  const size_t metadataBlocks = usedBlocks - reclaim;
+  if (metadataBlocks + slackBlocks >= blockCount) return 0;
+  const size_t ringBlocks = (blockCount - metadataBlocks - slackBlocks) / 2;
+  const size_t bytes = ringBlocks * (blockSize - kLfsCtzOverheadPerBlock);
+  const size_t records = bytes / sizeof(PunchRecord);
+  if (records == 0 || records < minRecords) return 0;
   return records * sizeof(PunchRecord);
+}
+
+// ringFileRewritable reports whether a ring file that already exists can
+// take an append anywhere in it: the free blocks must cover a full copy of
+// the file plus the slack, which is the same budget ringCapacityBytes sizes
+// for. A file it created always passes. One created by a build that sized
+// the ring at all of the free space does not, and would fault on its first
+// punch however long it was kept. The file's blocks are over-estimated
+// (bytes / (blockSize - 8), rounded up), so a doubtful file is reported as
+// not rewritable.
+inline bool ringFileRewritable(size_t blockSize, size_t blockCount,
+                               size_t usedBytes, size_t fileBytes,
+                               size_t slackBlocks) {
+  if (blockSize <= kLfsCtzOverheadPerBlock) return false;
+  const size_t usedBlocks = (usedBytes + blockSize - 1) / blockSize;
+  if (usedBlocks > blockCount) return false;
+  const size_t perBlock = blockSize - kLfsCtzOverheadPerBlock;
+  const size_t fileBlocks = (fileBytes + perBlock - 1) / perBlock;
+  return blockCount - usedBlocks >= fileBlocks + slackBlocks;
 }
 
 class RingBuffer {

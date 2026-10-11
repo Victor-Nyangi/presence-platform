@@ -326,38 +326,161 @@ static void testCursorsSurviveReboot() {
 // ---------------------------------------------------------------------
 // Ring file sizing (ring_buffer.h)
 //
-// The device sizes its ring file from whatever the LittleFS partition
-// actually has, rather than a magic number, so that enlarging the
-// partition later grows the buffer with no code change. The arithmetic
-// is pure and lives here because getting it wrong is silent: the buffer
-// just ends up smaller than anyone thinks it is.
+// The device sizes its ring file from the LittleFS geometry rather than a
+// magic number, so that enlarging the partition later grows the buffer with
+// no code change. The arithmetic is pure and lives here because getting it
+// wrong is silent until the first punch: a ring sized at all of the free
+// space preallocates fine, then copy-on-write runs out of blocks on the
+// first append and the terminal faults.
 // ---------------------------------------------------------------------
+
+static const size_t kBlock = 4096;     // esp_littlefs: one flash sector per block
+static const size_t kFreshUsed = 2 * kBlock;  // superblock/root pair after format
+static const size_t kSlack = 2;        // kRingSlackBlocks in littlefs_storage.h
+static const size_t kMinRecs = 256;    // kRingMinRecords
+
+// Exact littlefs CTZ geometry, as an independent model to test the formula's
+// bound against: block n >= 1 carries ctz(n)+1 pointers, and the sum of
+// ctz(1..m) is m - popcount(m).
+static size_t ctzCapacity(size_t blocks, size_t blockSize) {
+  if (blocks == 0) return 0;
+  const size_t m = blocks - 1;
+  const size_t pointers = 2 * m - static_cast<size_t>(__builtin_popcountll(m));
+  return blocks * blockSize - 4 * pointers;
+}
+
+static size_t ctzBlocks(size_t bytes, size_t blockSize) {
+  size_t n = bytes / blockSize;
+  while (ctzCapacity(n, blockSize) < bytes) n++;
+  return n;
+}
+
+struct Scheme {
+  const char* name;
+  size_t fsBytes;
+  size_t expected;   // records the formula gives with kSlack
+  size_t emulated;   // largest ring that survived rewriting offset 0 in
+                     // firmware/tools/littlefs_ring_sim.py (docs/firmware-build.md)
+};
+
+static const Scheme kSchemes[] = {
+    {"min_spiffs.csv, 128 KiB", 0x20000, 953, 1022},
+    {"custom 2 x 0x180000, 896 KiB", 0xE0000, 7494, 7563},
+    {"default.csv, 1408 KiB", 0x160000, 11855, 11923},
+};
+
+static void testRingCapacityPerPartitionScheme() {
+  printf("ring sizing per partition scheme\n");
+  const size_t rec = sizeof(PunchRecord);
+  for (const Scheme& sc : kSchemes) {
+    const size_t blocks = sc.fsBytes / kBlock;
+    const size_t cap = ringCapacityBytes(kBlock, blocks, kFreshUsed, 0, kSlack, kMinRecs);
+    const size_t records = cap / rec;
+    const std::string d = std::string(sc.name) + ": " + std::to_string(records) + " records";
+    printf("  %s -> %zu records (%zu B)\n", sc.name, records, cap);
+
+    check(records == sc.expected, "matches the documented capacity", d);
+    check(records <= sc.emulated, "at or below the largest ring that survives an in-place rewrite", d);
+    // Not so conservative that it gives away a real chunk of the buffer.
+    check(records * 100 >= sc.emulated * 90, "within 10% of the emulated limit", d);
+    check(cap * 2 <= sc.fsBytes, "leaves at least the file's size free for copy-on-write", d);
+
+    // With no slack the formula should land on the emulated boundary itself
+    // (the CTZ bound costs at most a record), which is what says the
+    // derivation models littlefs rather than merely being small enough.
+    const size_t edge = ringCapacityBytes(kBlock, blocks, kFreshUsed, 0, 0, kMinRecs) / rec;
+    check(edge <= sc.emulated && edge + 1 >= sc.emulated,
+          "with zero slack it reproduces the emulated boundary",
+          std::to_string(edge) + " vs " + std::to_string(sc.emulated));
+
+    // After create(), the file this produced must pass the rewritable check
+    // that begin() applies to an existing file -- or a terminal would throw
+    // away its own ring on every boot.
+    const size_t used = kFreshUsed + ctzBlocks(cap, kBlock) * kBlock;
+    check(ringFileRewritable(kBlock, blocks, used, cap, kSlack),
+          "the file it sizes is judged rewritable after a reboot", d);
+  }
+}
+
 static void testRingCapacitySizing() {
   printf("ring sizing\n");
   const size_t rec = sizeof(PunchRecord);
 
-  // 10 records' worth of space plus a stray 17 bytes: the remainder is
-  // unusable, because RingBuffer indexes by whole records.
-  check(ringCapacityBytes(rec * 10 + 17, 0, 0, 0, 1) == rec * 10,
+  // 10 blocks, no metadata, no slack: 5 ring blocks of (4096 - 8) bytes is
+  // 20,440 B, which is 340 whole records and 40 stray bytes.
+  check(ringCapacityBytes(kBlock, 10, 0, 0, 0, 1) == 340 * rec,
         "rounds down to a whole number of records");
 
-  check(ringCapacityBytes(rec * 10, 0, 0, rec * 2, 1) == rec * 8,
-        "holds back the reserve for filesystem metadata");
+  check(ringCapacityBytes(kBlock, 10, 2 * kBlock, 0, 0, 1) == ringCapacityBytes(kBlock, 8, 0, 0, 0, 1),
+        "blocks already in use come out of the budget before it is halved");
+  check(ringCapacityBytes(kBlock, 10, 0, 0, 2, 1) == ringCapacityBytes(kBlock, 8, 0, 0, 0, 1),
+        "slack blocks come out of the budget before it is halved");
+
+  // The old formula: everything free bar 8 KiB, which under min_spiffs was
+  // 1,911 records and faulted on the first append.
+  const size_t old = ((0x20000 - kFreshUsed) - 8 * 1024) / rec;
+  check(ringCapacityBytes(kBlock, 32, kFreshUsed, 0, kSlack, kMinRecs) / rec * 2 <= old,
+        "is at most half of what all-of-free-space sizing gave");
 
   // The second boot is the one that catches people out: usedBytes now
-  // includes the ring file itself, so a naive free-space calculation
-  // shrinks the buffer to nothing on every restart.
-  check(ringCapacityBytes(rec * 10, rec * 10, rec * 10, 0, 1) == rec * 10,
-        "reclaims the existing ring file instead of shrinking each boot");
+  // includes the ring file itself, so ignoring it would halve the buffer
+  // again on every restart. The file is reclaimed by whole blocks rounded
+  // down, so a stale file can shrink the result but never inflate it.
+  {
+    const size_t fresh = ringCapacityBytes(kBlock, 32, kFreshUsed, 0, kSlack, 1);
+    const size_t used = kFreshUsed + ctzBlocks(fresh, kBlock) * kBlock;
+    const size_t again = ringCapacityBytes(kBlock, 32, used, fresh, kSlack, 1);
+    const size_t naive = ringCapacityBytes(kBlock, 32, used, 0, kSlack, 1);
+    check(again > naive, "reclaims an existing ring file's blocks");
+    check(again <= fresh, "never sizes past what a fresh partition gives");
+  }
 
-  check(ringCapacityBytes(rec * 4, 0, 0, 0, 8) == 0,
+  check(ringCapacityBytes(kBlock, 32, kFreshUsed, 0, kSlack, 2000) == 0,
         "refuses a partition too small to hold the minimum");
-
-  check(ringCapacityBytes(rec * 4, rec * 9, 0, 0, 1) == 0,
+  check(ringCapacityBytes(kBlock, 4, 9 * kBlock, 0, 0, 1) == 0,
         "returns zero rather than underflowing when used exceeds total");
+  check(ringCapacityBytes(kBlock, 4, 0, 0, 4, 1) == 0,
+        "returns zero when the slack takes every block");
+  check(ringCapacityBytes(kBlock, 4, 2 * kBlock, 0, 2, 1) == 0,
+        "returns zero when metadata and slack leave nothing to halve");
+  check(ringCapacityBytes(8, 1000, 0, 0, 0, 1) == 0 && ringCapacityBytes(kBlock, 0, 0, 0, 0, 1) == 0,
+        "returns zero for a nonsensical geometry");
 
-  check(ringCapacityBytes(rec * 4, 0, 0, rec * 9, 1) == 0,
-        "returns zero when the reserve exceeds what is available");
+  // Sweep: for every partition size the formula's file, laid out the way
+  // littlefs really lays it out, leaves a full copy's worth of blocks free.
+  bool budgetHolds = true, rewritable = true;
+  for (size_t blocks = 4; blocks <= 1024; blocks++) {
+    const size_t cap = ringCapacityBytes(kBlock, blocks, kFreshUsed, 0, kSlack, 1);
+    if (cap == 0) continue;
+    const size_t fileBlocks = ctzBlocks(cap, kBlock);
+    if (2 * fileBlocks + 2 + kSlack > blocks) budgetHolds = false;
+    if (!ringFileRewritable(kBlock, blocks, kFreshUsed + fileBlocks * kBlock, cap, kSlack)) {
+      rewritable = false;
+    }
+  }
+  check(budgetHolds, "4..1024 blocks: file + copy + metadata + slack always fits");
+  check(rewritable, "4..1024 blocks: every sized file passes ringFileRewritable");
+}
+
+static void testOversizedRingFileIsNotRewritable() {
+  printf("ring file rewritable\n");
+  // What the pre-fix build created under min_spiffs: 1,911 records in 29
+  // blocks, leaving one block free of 32. Its first append ran out of space.
+  const size_t old = 1911 * sizeof(PunchRecord);
+  const size_t oldUsed = kFreshUsed + ctzBlocks(old, kBlock) * kBlock;
+  check(!ringFileRewritable(kBlock, 32, oldUsed, old, kSlack),
+        "a ring sized at all of the free space is not rewritable");
+  check(!ringFileRewritable(kBlock, 32, oldUsed, old, 0),
+        "not even with zero slack");
+
+  // The emulated boundary: 1,022 records in 15 blocks, 15 free.
+  const size_t edge = 1022 * sizeof(PunchRecord);
+  const size_t edgeUsed = kFreshUsed + ctzBlocks(edge, kBlock) * kBlock;
+  check(ringFileRewritable(kBlock, 32, edgeUsed, edge, 0), "the emulated boundary passes with zero slack");
+  check(!ringFileRewritable(kBlock, 32, edgeUsed, edge, kSlack), "but not once slack is required");
+
+  check(!ringFileRewritable(kBlock, 4, 9 * kBlock, 0, 0), "used past total is not rewritable");
+  check(!ringFileRewritable(8, 32, 0, 0, 0), "a nonsensical block size is not rewritable");
 }
 
 // A cursor pair with the tail past the head is not reachable through the
@@ -666,6 +789,8 @@ int main() {
   testOverflowDropsOldest();
   testCursorsSurviveReboot();
   testRingCapacitySizing();
+  testRingCapacityPerPartitionScheme();
+  testOversizedRingFileIsNotRewritable();
   testCorruptCursorsDoNotUnderflowDepth();
   testCursorsBeyondCapacityAreClamped();
   testAppendOnUnstartedBufferFails();
