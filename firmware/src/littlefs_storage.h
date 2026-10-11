@@ -13,15 +13,22 @@
 
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <esp_spi_flash.h>
 
 #include "ring_buffer.h"
 
 namespace presence {
 
-// LittleFS spends flash on block metadata and its own bookkeeping, so the
-// whole of the reported free space is never actually available to one file.
-// Holding back a slice keeps preallocation from failing at the last block.
-static const size_t kRingReserveBytes = 8 * 1024;
+// esp_littlefs uses one flash sector per littlefs block and does not expose
+// the figure, so take it from the flash driver. Together with totalBytes()
+// it gives the block count that ringCapacityBytes works in.
+static const size_t kLfsBlockSize = SPI_FLASH_SEC_SIZE;
+
+// Spare blocks on top of the copy-on-write budget, so littlefs can relocate
+// a worn metadata pair (one pair = 2 blocks) during a commit while both the
+// old and the new copy of the ring file are still allocated. See
+// ringCapacityBytes in ring_buffer.h for the whole derivation.
+static const size_t kRingSlackBlocks = 2;
 
 // Below this the buffer cannot cover a meaningful outage, and booting with
 // it would be worse than refusing: the terminal would look healthy and
@@ -42,7 +49,22 @@ class LittleFsStorage : public Storage {
   // begin returns false when the filesystem cannot give us a usable buffer.
   // Callers must treat that as a fault, not carry on.
   bool begin() {
-    const size_t existing = LittleFS.exists(path_) ? existingSize() : 0;
+    const size_t blocks = LittleFS.totalBytes() / kLfsBlockSize;
+    size_t existing = LittleFS.exists(path_) ? existingSize() : 0;
+
+    // A ring file too big to be rewritten in place faults on its first
+    // punch, so keeping it would keep the terminal broken. Builds before
+    // the copy-on-write cap made exactly that file. If it holds nothing
+    // unacknowledged, drop it and size a new one. If it holds records, keep
+    // it: they can still be read and uploaded, and a failed append faults
+    // as designed rather than losing them.
+    if (existing >= kRingMinRecords * sizeof(PunchRecord) &&
+        !ringFileRewritable(kLfsBlockSize, blocks, LittleFS.usedBytes(),
+                            existing, kRingSlackBlocks) &&
+        bufferEmpty()) {
+      if (!LittleFS.remove(path_)) return false;
+      existing = 0;
+    }
 
     // An existing file keeps its own size, even if the partition now has
     // room for more. RingBuffer indexes modulo the slot count, so changing
@@ -56,8 +78,8 @@ class LittleFsStorage : public Storage {
       return static_cast<bool>(file_);
     }
 
-    capacity_ = ringCapacityBytes(LittleFS.totalBytes(), LittleFS.usedBytes(),
-                                  existing, kRingReserveBytes, kRingMinRecords);
+    capacity_ = ringCapacityBytes(kLfsBlockSize, blocks, LittleFS.usedBytes(),
+                                  existing, kRingSlackBlocks, kRingMinRecords);
     if (capacity_ == 0) return false;
     return create();
   }
@@ -104,6 +126,13 @@ class LittleFsStorage : public Storage {
 
  private:
   static constexpr const char* kCursorKey = "ring_cursors";
+
+  // No cursors, or head == tail: nothing in the ring is waiting for an ack.
+  bool bufferEmpty() {
+    uint64_t head = 0, tail = 0;
+    if (!loadCursors(&head, &tail)) return true;
+    return head == tail;
+  }
 
   size_t existingSize() {
     File f = LittleFS.open(path_, "r");
