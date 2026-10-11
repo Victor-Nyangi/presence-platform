@@ -2,7 +2,7 @@
 
 Credential-agnostic presence and attendance tracking for offices, hospitals and schools. Terminals read a fingerprint (or a card, or a PIN) and record *who was here, when* — reliably, including while the network is down.
 
-> **Status: early.** The gateway and schema are built and tested. The firmware's protocol-critical logic — ring buffer, signing string, batch serialisation, response parsing — is covered by host tests, and the batch payload it produces has been checked against the real gateway. `setup()` now constructs the LittleFS-backed buffer, and the firmware builds with the ESP32 toolchain (first build 2026-10-11, see [`docs/firmware-build.md`](docs/firmware-build.md)). It has never run on a board, and host emulation says the buffer as sized faults on the first punch — see *First ESP32 build* below.
+> **Status: early.** The gateway and schema are built and tested. The firmware's protocol-critical logic — ring buffer, signing string, batch serialisation, response parsing — is covered by host tests, and the batch payload it produces has been checked against the real gateway. `setup()` now constructs the LittleFS-backed buffer, and the firmware builds with the ESP32 toolchain (first build 2026-10-11, see [`docs/firmware-build.md`](docs/firmware-build.md)). It has never run on a board. Host emulation showed the first buffer sizing faulting on the first punch; the ring is now capped at what littlefs's copy-on-write can rewrite (about half the filesystem) — see *First ESP32 build* below.
 
 ## Why this exists
 
@@ -164,12 +164,12 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 
 ### First ESP32 build
 
-Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings and no source changes. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
+Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
 
-- **Size:** 746,909 B flash (38.0% of the app slot), 39,812 B static RAM (12.1%).
-- **OTA slack:** 1,217,632 B free in the 1,966,080 B OTA slot (61.9%). Under `default.csv` it would be 562,272 B (42.9%).
-- **Buffer, computed:** `ringCapacityBytes` would give **1,911 records** under `min_spiffs` and 23,756 under `default`. This is an estimate: only the boot line on a board is authoritative.
-- **Buffer, usable:** an estimate from emulation, not yet seen on hardware. littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks. At the computed size, the first `append()` therefore fails with `LFS_ERR_NOSPC` and the terminal goes to `Fault`. A ring only works up to about half the filesystem: 1,022 records under `min_spiffs`, 11,923 under `default`, at ~8 block erases per punch. How to fix it is an open design decision.
+- **Size:** 747,089 B flash (38.0% of the app slot), 39,812 B static RAM (12.1%).
+- **OTA slack:** 1,217,456 B free in the 1,966,080 B OTA slot (61.9%). Under `default.csv` it would be 562,096 B (42.9%).
+- **Buffer:** **953 records** under `min_spiffs`, 7,494 with a custom 896 KiB filesystem, 11,855 under `default` (was 1,911 / 15,018 / 23,756). littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks; the old size filled 31 of 32 blocks and the first `append()` failed with `LFS_ERR_NOSPC`, sending the terminal to `Fault`. `ringCapacityBytes` now derives the size from the filesystem geometry: `(blocks - metadata - 2 slack) / 2` ring blocks of `block_size - 8` bytes. Host emulation runs the new size through repeated full laps of appends with no `LFS_ERR_NOSPC`, at ~7.5 block erases per punch under `min_spiffs`.
+- **Pending on hardware:** the record count is still an estimate until a board prints its `punch buffer: N records` boot line (953 expected under `min_spiffs`), and punch latency from those erases has not been measured.
 
 ### Bill of materials (prototype)
 
@@ -188,7 +188,7 @@ Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6
 - [x] Gateway: signing, idempotent ingest, commands, roster
 - [x] Firmware: buffer + signing logic, host-tested
 - [x] Firmware: batch serialisation + response parsing, host-tested against the gateway
-- [ ] Firmware: LittleFS `Storage` implementation — built, but emulation says the computed ring size cannot be rewritten in place (see *First ESP32 build*)
+- [ ] Firmware: LittleFS `Storage` implementation — built, ring capped for copy-on-write and emulated; board confirmation pending (see *First ESP32 build*)
 - [x] Firmware: first build with the ESP32 toolchain (2026-10-11)
 - [ ] Firmware: first run on hardware
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
