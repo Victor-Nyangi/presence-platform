@@ -1,0 +1,31 @@
+Monocypher 4.0.2, vendored UNMODIFIED for OTA signature verification
+(firmware/src/ota_verify.h). Do not edit these files; upgrade by replacing them.
+
+Source:   https://monocypher.org/download/monocypher-4.0.2.tar.gz
+          sha256 38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c
+Checked:  identical to https://github.com/LoupVaillant/Monocypher tag 4.0.2
+          apart from the "Monocypher version" banner line (__git__ vs 4.0.2).
+Licence:  CC0-1.0 OR BSD-2-Clause (LICENCE.md)
+
+Files (from src/ and src/optional/):
+  afe2b098c8569577a84488e0b98d276d1fba6506adea68bb9241a52111734c59  monocypher.c
+  f78bb31255cfb7beba66afd2137f5194c8a025cf40488b6cc1e295234d43f374  monocypher.h
+  7c9b16056cbd27521919e8a6f56a228808b9e718afc42e3d33f28c08e5abdee2  monocypher-ed25519.c
+  bd546edcd468d64e28caa3dbf4b1d6bfad7435c0ce994723fd81aae26405121b  monocypher-ed25519.h
+
+Why Monocypher: small, single-file C99 with no allocation and no platform
+dependencies, so the identical sources compile for the ESP32 (xtensa gcc 8.4)
+and for the host tests (gcc/g++). Audited by Cure53 in 2020, findings closed
+in 3.1.2; 4.x has since reworked the API, so 4.0.2 is post-audit code, which
+is why the host tests run the RFC 8032 vectors against it. Its low-level API
+(crypto_eddsa_check_equation + crypto_eddsa_reduce + streaming SHA-512)
+verifies pure Ed25519 over an image streamed in chunks, which a 750 KB image
+on a 320 KB-RAM device needs.
+
+Why not the libsodium the framework already ships (ESP-IDF's "1.0.12-idf",
+precompiled into framework-arduinoespressif32): its pure-Ed25519 verify,
+crypto_sign_verify_detached, is one-shot and needs the whole image in RAM.
+Its multipart API is Ed25519ph, a different scheme from the "Ed25519 over the
+image" docs/openapi.yaml specifies. And it is a precompiled 2017-era fork,
+so host tests would run a different libsodium build from the one on the
+device. mbedtls in ESP-IDF 4.4 has no Ed25519 at all.
