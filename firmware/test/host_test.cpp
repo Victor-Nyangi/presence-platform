@@ -4,17 +4,22 @@
 //     make firmware-test
 //
 // What is NOT covered here: anything touching the sensor, Wi-Fi, or real
-// flash. Those need hardware.
+// flash. Those need hardware. The OTA gate (ota_verify.h) IS covered: the
+// same Monocypher sources the terminal links are compiled in here.
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "../src/canonical.h"
 #include "../src/events_json.h"
+#include "../src/ota_pubkey.h"
+#include "../src/ota_verify.h"
 #include "../src/ring_buffer.h"
+#include "rfc8032_vectors.h"
 
 using namespace presence;
 
@@ -778,6 +783,316 @@ static void testServerTimeParsingForClockSkew() {
   check(!parseJsonInt("{\"status\":401}", "server_time_ms", &out), "missing key reports failure");
 }
 
+// ---------------------------------------------------------------------
+// OTA: Ed25519 over the image (ota_verify.h)
+// ---------------------------------------------------------------------
+
+// A signing key generated for this run only. Nothing here is persisted: the
+// seed comes from the OS RNG, Monocypher wipes it, and the secret key dies
+// with the process. The private release key never touches a test.
+struct TestKey {
+  uint8_t sk[64];
+  uint8_t pk[32];
+};
+
+static TestKey makeTestKey() {
+  std::random_device rd;
+  uint8_t seed[32];
+  for (auto& b : seed) b = static_cast<uint8_t>(rd());
+  TestKey k;
+  crypto_ed25519_key_pair(k.sk, k.pk, seed);
+  return k;
+}
+
+static std::vector<uint8_t> makeImage(size_t n) {
+  std::vector<uint8_t> img(n);
+  std::mt19937 rng(static_cast<unsigned>(n) * 2654435761u);
+  for (auto& b : img) b = static_cast<uint8_t>(rng());
+  return img;
+}
+
+static std::vector<uint8_t> signImage(const TestKey& k, const std::vector<uint8_t>& img) {
+  std::vector<uint8_t> sig(64);
+  crypto_ed25519_sign(sig.data(), k.sk, img.data(), img.size());
+  return sig;
+}
+
+// Streams img through an ImageVerifier in `chunk`-sized pieces, as main.cpp
+// does when it reads the OTA partition back.
+static OtaVerdict verifyStreamed(const uint8_t* pk, const uint8_t* sig, size_t expected,
+                                 const uint8_t* img, size_t len, size_t chunk) {
+  ImageVerifier v(pk, sig, expected);
+  for (size_t off = 0; off < len; off += chunk) {
+    v.update(img + off, len - off < chunk ? len - off : chunk);
+  }
+  return v.finish();
+}
+
+static OtaVerdict verifyImage(const TestKey& k, const std::vector<uint8_t>& sig,
+                              const std::vector<uint8_t>& img) {
+  return verifyStreamed(k.pk, sig.data(), img.size(), img.data(), img.size(), 4096);
+}
+
+static void testRfc8032Vectors() {
+  printf("\nOTA: RFC 8032 section 7.1 Ed25519 vectors\n");
+  for (const auto& v : rfc8032::kVectors) {
+    const std::string name = v.name;
+    check(ed25519Verify(v.sig, v.pk, v.msg, v.msgLen), (name + " verifies").c_str());
+
+    uint8_t sig[64];
+    memcpy(sig, v.sig, 64);
+    sig[0] ^= 0x01;
+    check(!ed25519Verify(sig, v.pk, v.msg, v.msgLen), (name + " with a flipped R bit is rejected").c_str());
+    memcpy(sig, v.sig, 64);
+    sig[40] ^= 0x01;
+    check(!ed25519Verify(sig, v.pk, v.msg, v.msgLen), (name + " with a flipped S bit is rejected").c_str());
+
+    if (v.msgLen > 0) {
+      std::vector<uint8_t> msg(v.msg, v.msg + v.msgLen);
+      msg[msg.size() / 2] ^= 0x80;
+      check(!ed25519Verify(v.sig, v.pk, msg.data(), msg.size()),
+            (name + " with a flipped message bit is rejected").c_str());
+      // The streaming path must agree with the one-shot primitive whatever
+      // the chunking -- byte at a time, an odd size, and one big chunk.
+      bool allChunkings = true;
+      for (size_t chunk : {static_cast<size_t>(1), static_cast<size_t>(7), static_cast<size_t>(4096)}) {
+        allChunkings = allChunkings &&
+                       verifyStreamed(v.pk, v.sig, v.msgLen, v.msg, v.msgLen, chunk) == OtaVerdict::Ok;
+      }
+      check(allChunkings, (name + " streams through ImageVerifier at chunk 1/7/4096").c_str());
+    }
+  }
+}
+
+static void testValidImageSignatureAccepted() {
+  printf("\nOTA: a signed image is accepted\n");
+  const TestKey k = makeTestKey();
+  // Deliberately not a multiple of the 4 KB read-back chunk.
+  const std::vector<uint8_t> img = makeImage(150 * 1024 + 123);
+  const std::vector<uint8_t> sig = signImage(k, img);
+  check(verifyImage(k, sig, img) == OtaVerdict::Ok, "image signed with a test-time key verifies");
+  check(verifyStreamed(k.pk, sig.data(), img.size(), img.data(), img.size(), 1000) == OtaVerdict::Ok,
+        "and verifies at a different chunk size");
+  check(ed25519Verify(sig.data(), k.pk, img.data(), img.size()),
+        "streaming agrees with one-shot verification");
+
+  const std::vector<uint8_t> one = makeImage(1);
+  check(verifyImage(k, signImage(k, one), one) == OtaVerdict::Ok, "a 1-byte image verifies");
+}
+
+static void testTamperedImageRejected() {
+  printf("\nOTA: a tampered image is rejected\n");
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> img = makeImage(64 * 1024);
+  const std::vector<uint8_t> sig = signImage(k, img);
+
+  const size_t positions[] = {0, 1, img.size() / 2, img.size() - 1};
+  const char* names[] = {"first byte flipped is rejected", "second byte flipped is rejected",
+                         "middle byte flipped is rejected", "last byte flipped is rejected"};
+  for (size_t i = 0; i < 4; i++) {
+    std::vector<uint8_t> bad = img;
+    bad[positions[i]] ^= 0x01;
+    check(verifyImage(k, sig, bad) == OtaVerdict::BadSignature, names[i]);
+  }
+
+  std::vector<uint8_t> extended = img;
+  extended.push_back(0x00);
+  check(verifyStreamed(k.pk, sig.data(), img.size(), extended.data(), extended.size(), 4096) ==
+            OtaVerdict::SizeMismatch,
+        "an appended byte is rejected against the manifest size");
+  check(verifyImage(k, sig, extended) == OtaVerdict::BadSignature,
+        "an appended byte is rejected even when the manifest size is changed to match");
+
+  std::vector<uint8_t> shortened(img.begin(), img.end() - 1);
+  check(verifyStreamed(k.pk, sig.data(), img.size(), shortened.data(), shortened.size(), 4096) ==
+            OtaVerdict::SizeMismatch,
+        "a truncated image is rejected against the manifest size");
+  check(verifyImage(k, sig, shortened) == OtaVerdict::BadSignature,
+        "a truncated image is rejected even when the manifest size is changed to match");
+}
+
+static void testWrongKeyRejected() {
+  printf("\nOTA: a signature from another key is rejected\n");
+  const TestKey release = makeTestKey();
+  const TestKey other = makeTestKey();
+  const std::vector<uint8_t> img = makeImage(32 * 1024);
+  check(verifyImage(release, signImage(other, img), img) == OtaVerdict::BadSignature,
+        "image signed by a different key is rejected");
+
+  TestKey nearMiss = release;
+  nearMiss.pk[31] ^= 0x01;
+  check(verifyImage(nearMiss, signImage(release, img), img) == OtaVerdict::BadSignature,
+        "a public key one bit off is rejected");
+}
+
+static void testMalformedSignatureRejected() {
+  printf("\nOTA: truncated and malformed signatures are rejected\n");
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> img = makeImage(8 * 1024);
+  const std::vector<uint8_t> sig = signImage(k, img);
+  const std::string hex = toHex(sig.data(), sig.size());
+  uint8_t decoded[64];
+
+  check(decodeHexExact(hex, decoded, 64) && memcmp(decoded, sig.data(), 64) == 0,
+        "the full 128-hex signature decodes");
+  check(!decodeHexExact(hex.substr(0, 127), decoded, 64), "a signature one hex digit short does not decode");
+  check(!decodeHexExact(hex.substr(0, 126), decoded, 64), "a signature one byte short does not decode");
+  check(!decodeHexExact(hex.substr(0, 64), decoded, 64), "half a signature does not decode");
+  check(!decodeHexExact(hex + "00", decoded, 64), "a signature with a trailing byte does not decode");
+  check(!decodeHexExact(std::string(127, 'a') + "g", decoded, 64), "a non-hex digit does not decode");
+  check(!decodeHexExact("", decoded, 64), "an empty signature does not decode");
+
+  // A signature truncated and then zero-padded back to 64 bytes.
+  std::vector<uint8_t> padded = sig;
+  for (size_t i = 32; i < 64; i++) padded[i] = 0;
+  check(verifyImage(k, padded, img) == OtaVerdict::BadSignature, "a zero-padded truncated signature is rejected");
+  check(verifyImage(k, std::vector<uint8_t>(64, 0), img) == OtaVerdict::BadSignature,
+        "an all-zero signature is rejected");
+
+  // S + L verifies the same equation, so a lax verifier would accept it.
+  // Monocypher refuses S >= L; this pins that we did not lose it.
+  static const uint8_t kL[32] = {0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7,
+                                 0xa2, 0xde, 0xf9, 0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10};
+  std::vector<uint8_t> malleable = sig;
+  unsigned carry = 0;
+  for (size_t i = 0; i < 32; i++) {
+    const unsigned t = malleable[32 + i] + kL[i] + carry;
+    malleable[32 + i] = static_cast<uint8_t>(t);
+    carry = t >> 8;
+  }
+  check(verifyImage(k, malleable, img) == OtaVerdict::BadSignature,
+        "a non-canonical S (S + L) is rejected");
+}
+
+static void testEmptyImageRejected() {
+  printf("\nOTA: an empty image is rejected\n");
+  // RFC 8032 TEST 1 is a VALID signature over the empty message. The
+  // primitive accepts it; the OTA policy must not.
+  const rfc8032::Vector& empty = rfc8032::kVectors[0];
+  check(empty.msgLen == 0 && ed25519Verify(empty.sig, empty.pk, empty.msg, 0),
+        "TEST 1 is a valid signature over an empty message");
+  check(verifyStreamed(empty.pk, empty.sig, 0, empty.msg, 0, 4096) == OtaVerdict::EmptyImage,
+        "the same signature as an OTA image is rejected as empty");
+
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> img = makeImage(4096);
+  const std::vector<uint8_t> sig = signImage(k, img);
+  check(verifyStreamed(k.pk, sig.data(), img.size(), img.data(), 0, 4096) == OtaVerdict::EmptyImage,
+        "a download that delivered no bytes is rejected");
+}
+
+static void testUnprovisionedKeyRefusesEverything() {
+  printf("\nOTA: no release key compiled in\n");
+  const uint8_t zero[32] = {0};
+  check(isUnprovisionedKey(zero), "the all-zero key is the unprovisioned sentinel");
+  const TestKey k = makeTestKey();
+  check(!isUnprovisionedKey(k.pk), "a real key is not");
+
+  const std::vector<uint8_t> img = makeImage(4096);
+  const std::vector<uint8_t> sig = signImage(k, img);
+  check(verifyStreamed(zero, sig.data(), img.size(), img.data(), img.size(), 4096) == OtaVerdict::NoKey,
+        "the sentinel refuses an image before any curve arithmetic");
+
+  // The committed key must be either the sentinel or a real key; either way
+  // it refuses an image signed by a key generated here.
+  const OtaVerdict committed =
+      verifyStreamed(kOtaReleasePublicKey, sig.data(), img.size(), img.data(), img.size(), 4096);
+  check(committed == OtaVerdict::NoKey || committed == OtaVerdict::BadSignature,
+        "the committed release key refuses a test-key image");
+}
+
+static void testVerifierIsSingleUse() {
+  printf("\nOTA: a verdict cannot be reused\n");
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> img = makeImage(1024);
+  const std::vector<uint8_t> sig = signImage(k, img);
+  ImageVerifier v(k.pk, sig.data(), img.size());
+  v.update(img.data(), img.size());
+  check(v.finish() == OtaVerdict::Ok, "first finish() is ok");
+  check(v.finish() == OtaVerdict::BadSignature, "a second finish() is not");
+}
+
+// The golden vector pinning the signing tool to the firmware, the way the
+// HMAC golden vector pins the gateway to the device. The same values are in
+// gateway/internal/fwsign/fwsign_test.go. They were produced once with a key
+// generated in memory and never written anywhere; only the public half
+// exists. If the tool ever signs something other than the raw image bytes
+// (a hash, hex, a prehash variant), one side of this fails.
+static std::vector<uint8_t> goldenImage() {
+  std::vector<uint8_t> img(4099);
+  for (size_t i = 0; i < img.size(); i++) img[i] = static_cast<uint8_t>((i * 167 + 13) ^ (i >> 8));
+  return img;
+}
+static const char* kGoldenPublicKey = "3cd093728d823e9acc0bff6a7d13fa56ebb1ec74919534be98cb7a0621dd1858";
+static const char* kGoldenSignature =
+    "5c4bcc9ae75f0e50435e512ff754ba38ba074890774fff7eabe74be5963b3415"
+    "f7627f50e35ee73fb7b80137a92228bbaf3b864592b325064ba881bd8c247d08";
+
+static void testSigningToolGoldenVector() {
+  printf("\nOTA: signing tool golden vector\n");
+  uint8_t pk[32], sig[64];
+  check(decodeHexExact(kGoldenPublicKey, pk, 32) && decodeHexExact(kGoldenSignature, sig, 64),
+        "golden key and signature decode");
+  const std::vector<uint8_t> img = goldenImage();
+  check(verifyStreamed(pk, sig, img.size(), img.data(), img.size(), 4096) == OtaVerdict::Ok,
+        "an image signed by Go crypto/ed25519 verifies on the firmware path");
+  std::vector<uint8_t> bad = img;
+  bad[4098] ^= 0x01;
+  check(verifyStreamed(pk, sig, bad.size(), bad.data(), bad.size(), 4096) == OtaVerdict::BadSignature,
+        "and the same image with its last byte flipped does not");
+}
+
+static void testManifestParsing() {
+  printf("\nOTA: manifest parsing\n");
+  const std::string sha(64, 'a');
+  const std::string sig = std::string(kGoldenSignature);
+  auto manifest = [&](const std::string& shaV, const std::string& sigV, const std::string& size) {
+    return std::string("{\"available\":true,\"version\":\"0.2.0\",\"url\":\"https:\\/\\/fw.example.com/p.bin?a=1&b=2\",") +
+           "\"size\":" + size + ",\"sha256\":\"" + shaV + "\",\"signature\":\"" + sigV + "\"}";
+  };
+
+  OtaManifest m;
+  check(parseOtaManifest(manifest(sha, sig, "4099").c_str(), &m) && m.available && m.size == 4099 &&
+            m.version == "0.2.0" && m.url == "https://fw.example.com/p.bin?a=1&b=2" && m.sha256[0] == 0xaa &&
+            m.signature[0] == 0x5c && m.signature[63] == 0x08,
+        "a complete manifest parses");
+
+  OtaManifest none;
+  check(parseOtaManifest("{\"available\": false}", &none) && !none.available,
+        "available:false parses as no update");
+  check(!parseOtaManifest("{}", &m), "a manifest without available is refused");
+  check(!parseOtaManifest(manifest(sha, sig.substr(0, 126), "4099").c_str(), &m),
+        "a truncated signature is refused");
+  check(!parseOtaManifest(manifest(sha, sig + "00", "4099").c_str(), &m), "an over-long signature is refused");
+  check(!parseOtaManifest(manifest(sha.substr(0, 63), sig, "4099").c_str(), &m), "a short sha256 is refused");
+  check(!parseOtaManifest(manifest(sha, sig, "0").c_str(), &m), "size 0 is refused");
+  check(!parseOtaManifest(manifest(sha, sig, "-5").c_str(), &m), "a negative size is refused");
+  check(!parseOtaManifest(manifest(sha, sig, "\"4099\"").c_str(), &m), "a quoted size is refused");
+
+  const std::string noSig = "{\"available\":true,\"version\":\"0.2.0\",\"url\":\"https://x/p.bin\",\"size\":10,"
+                            "\"sha256\":\"" + sha + "\"}";
+  check(!parseOtaManifest(noSig.c_str(), &m), "a manifest without a signature is refused");
+
+  const std::string ftp = "{\"available\":true,\"version\":\"0.2.0\",\"url\":\"ftp://x/p.bin\",\"size\":10,"
+                          "\"sha256\":\"" + sha + "\",\"signature\":\"" + sig + "\"}";
+  check(!parseOtaManifest(ftp.c_str(), &m), "a non-http(s) URL is refused");
+
+  const std::string unicode = "{\"available\":true,\"version\":\"0.2.0\",\"url\":\"https://x/p?a=1\\u0026b=2\","
+                              "\"size\":10,\"sha256\":\"" + sha + "\",\"signature\":\"" + sig + "\"}";
+  check(!parseOtaManifest(unicode.c_str(), &m), "a \\u escape is refused rather than guessed at");
+
+  std::string out;
+  check(parseJsonString("{\"note\":\"signature\",\"signature\":\"ab\"}", "signature", &out, 8) && out == "ab",
+        "a key name appearing as a value is skipped");
+  check(!parseJsonString("{\"v\":\"abcdefghi\"}", "v", &out, 8), "a string over maxLen is refused");
+  check(!parseJsonString("{\"v\":\"abc", "v", &out, 8), "an unterminated string is refused");
+  bool b = true;
+  check(parseJsonBool("{\"firmware_available\": false}", "firmware_available", &b) && !b,
+        "firmware_available:false parses");
+  check(!parseJsonBool("{\"firmware_available\": 1}", "firmware_available", &b), "a non-boolean is refused");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -807,6 +1122,16 @@ int main() {
   testZeroEventsIsStillValidJson();
   testAckParsing();
   testServerTimeParsingForClockSkew();
+  testRfc8032Vectors();
+  testValidImageSignatureAccepted();
+  testTamperedImageRejected();
+  testWrongKeyRejected();
+  testMalformedSignatureRejected();
+  testEmptyImageRejected();
+  testUnprovisionedKeyRefusesEverything();
+  testVerifierIsSingleUse();
+  testSigningToolGoldenVector();
+  testManifestParsing();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;
