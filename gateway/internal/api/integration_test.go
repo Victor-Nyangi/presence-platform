@@ -10,6 +10,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,6 +28,8 @@ import (
 
 	"presence/internal/auth"
 	"presence/internal/cryptobox"
+	"presence/internal/firmware"
+	"presence/internal/fwsign"
 	"presence/internal/model"
 	"presence/internal/store"
 )
@@ -43,6 +47,7 @@ const (
 var deviceSecret = []byte("0123456789abcdef0123456789abcdef")
 
 type harness struct {
+	api    *Server
 	srv    *httptest.Server
 	pool   *pgxpool.Pool
 	now    time.Time
@@ -112,7 +117,7 @@ func setup(t *testing.T, mode string) *harness {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	api := NewServer(st, auth.NewMemoryNonceCache(), log)
 
-	h := &harness{pool: pool, now: time.Now().UTC().Truncate(time.Millisecond)}
+	h := &harness{api: api, pool: pool, now: time.Now().UTC().Truncate(time.Millisecond)}
 	api.SetClock(func() time.Time { return h.now })
 	h.srv = httptest.NewServer(api.Routes())
 	t.Cleanup(func() { h.srv.Close(); pool.Close() })
@@ -554,5 +559,86 @@ func TestHeartbeatReportsPendingCommands(t *testing.T) {
 		`SELECT status::text FROM device_command WHERE id=$1::uuid`, cr.Commands[0].ID).Scan(&status)
 	if status != "succeeded" {
 		t.Errorf("command status = %q", status)
+	}
+}
+
+// The OTA path end to end, as a terminal would walk it: the heartbeat says
+// there is an update, the manifest for the device's channel comes back over
+// a signed GET, and the image downloads over another signed GET and verifies
+// against the release key. Moving the device to another channel changes what
+// it is offered.
+func TestFirmwareOverTheSignedRoutes(t *testing.T) {
+	h := setup(t, "bidirectional")
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	stable, stableImg := writeRelease(t, dir, priv, "stable", "0.2.0", 40_000)
+	beta, _ := writeRelease(t, dir, priv, "beta", "0.3.0", 41_000)
+	cat, err := firmware.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.api.SetFirmware(cat)
+
+	heartbeat := func(version string) bool {
+		code, body := h.do(t, "POST", "/v1/device/heartbeat", model.HeartbeatRequest{FirmwareVersion: version}, 0)
+		if code != http.StatusOK {
+			t.Fatalf("heartbeat: %d %s", code, body)
+		}
+		var hb model.HeartbeatResponse
+		json.Unmarshal(body, &hb)
+		return hb.FirmwareAvailable
+	}
+	if !heartbeat("0.1.0") {
+		t.Fatal("heartbeat from 0.1.0 did not report the 0.2.0 release")
+	}
+	if heartbeat("0.2.0") {
+		t.Fatal("heartbeat from 0.2.0 reported its own version as an update")
+	}
+
+	code, body := h.do(t, "GET", "/v1/device/firmware?current=0.1.0", nil, 0)
+	if code != http.StatusOK {
+		t.Fatalf("manifest: %d %s", code, body)
+	}
+	var m model.FirmwareManifest
+	json.Unmarshal(body, &m)
+	if !m.Available || m.Version != "0.2.0" || m.URL != firmware.ImagePathPrefix+stable.SHA256 {
+		t.Fatalf("manifest %+v", m)
+	}
+
+	code, img := h.do(t, "GET", m.URL, nil, 0)
+	if code != http.StatusOK || !bytes.Equal(img, stableImg) {
+		t.Fatalf("image: %d, %d bytes", code, len(img))
+	}
+	if err := fwsign.Verify(pub, img, m); err != nil {
+		t.Fatalf("downloaded image does not verify against the served manifest: %v", err)
+	}
+
+	// Unsigned: refused, and nothing of the image leaks.
+	resp, err := http.Get(h.srv.URL + m.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unsigned image download: %d", resp.StatusCode)
+	}
+
+	if _, err := h.pool.Exec(context.Background(),
+		`UPDATE device SET firmware_channel = 'beta' WHERE id = $1`, deviceID); err != nil {
+		t.Fatal(err)
+	}
+	code, body = h.do(t, "GET", "/v1/device/firmware?current=0.2.0", nil, 0)
+	json.Unmarshal(body, &m)
+	if code != http.StatusOK || !m.Available || m.Version != "0.3.0" || m.SHA256 != beta.SHA256 {
+		t.Fatalf("beta channel: %d %s", code, body)
+	}
+
+	// The column refuses a name that could walk out of the release directory.
+	if _, err := h.pool.Exec(context.Background(),
+		`UPDATE device SET firmware_channel = '../stable' WHERE id = $1`, deviceID); err == nil {
+		t.Fatal("firmware_channel accepted a path")
 	}
 }

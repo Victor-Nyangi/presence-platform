@@ -154,6 +154,12 @@ CREATE TABLE device (
     provisioned_at      timestamptz,
 
     firmware_version    text,
+    -- Which OTA release this device is offered: a directory under the
+    -- gateway's PRESENCE_FIRMWARE_DIR. The pattern also keeps the name from
+    -- walking out of that directory.
+    firmware_channel    text NOT NULL DEFAULT 'stable'
+                        CONSTRAINT device_firmware_channel_format
+                        CHECK (firmware_channel ~ '^[a-z0-9][a-z0-9-]{0,31}$'),
     config_version      integer NOT NULL DEFAULT 1,
     roster_version      bigint  NOT NULL DEFAULT 0,
     slot_capacity       integer NOT NULL DEFAULT 1000,

@@ -21,6 +21,10 @@ type Config struct {
 	ReadTimeout   time.Duration
 	WriteTimeout  time.Duration
 	ShutdownGrace time.Duration
+	// FirmwareDir holds published OTA releases (internal/firmware). Optional:
+	// unset means no releases, and every device is told available=false.
+	// Set but missing is an error at start.
+	FirmwareDir string
 }
 
 func Load() (Config, error) {
@@ -31,6 +35,7 @@ func Load() (Config, error) {
 		ReadTimeout:   envDuration("PRESENCE_READ_TIMEOUT", 15*time.Second),
 		WriteTimeout:  envDuration("PRESENCE_WRITE_TIMEOUT", 30*time.Second),
 		ShutdownGrace: envDuration("PRESENCE_SHUTDOWN_GRACE", 20*time.Second),
+		FirmwareDir:   os.Getenv("PRESENCE_FIRMWARE_DIR"),
 	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("PRESENCE_DATABASE_URL is required")

@@ -46,6 +46,9 @@ type Device struct {
 	LastAckSeq    int64
 	ConfigVersion int
 	RosterVersion int64
+	// FirmwareChannel picks which release in PRESENCE_FIRMWARE_DIR this
+	// device is offered ("stable" unless someone moves it).
+	FirmwareChannel string
 }
 
 // LoadDevice fetches signing material. Both the current and previous device
@@ -55,7 +58,7 @@ func (s *Store) LoadDevice(ctx context.Context, id string) (*Device, error) {
 		SELECT d.id::text, d.org_id::text, d.site_id::text, d.state::text, d.mode::text,
 		       d.key_version, d.secret_enc, d.secret_nonce, d.secret_key_id,
 		       d.prev_key_version, d.prev_secret_enc, d.prev_secret_nonce, d.prev_secret_key_id,
-		       d.last_ack_seq, d.config_version, d.roster_version
+		       d.last_ack_seq, d.config_version, d.roster_version, d.firmware_channel
 		FROM device d WHERE d.id = $1`
 
 	var (
@@ -71,7 +74,7 @@ func (s *Store) LoadDevice(ctx context.Context, id string) (*Device, error) {
 		&d.ID, &d.OrgID, &d.SiteID, &d.State, &d.Mode,
 		&keyVersion, &secEnc, &secNonce, &secKeyID,
 		&prevVersion, &prevEnc, &prevNonce, &prevKeyID,
-		&d.LastAckSeq, &d.ConfigVersion, &d.RosterVersion,
+		&d.LastAckSeq, &d.ConfigVersion, &d.RosterVersion, &d.FirmwareChannel,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeviceUnknown

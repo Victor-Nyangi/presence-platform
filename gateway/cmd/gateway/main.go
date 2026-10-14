@@ -23,6 +23,7 @@ import (
 	"presence/internal/auth"
 	"presence/internal/config"
 	"presence/internal/cryptobox"
+	"presence/internal/firmware"
 	"presence/internal/store"
 )
 
@@ -70,6 +71,14 @@ func run(log *slog.Logger) error {
 
 	st := store.New(pool, keyring, cfg.TokenPepper)
 	srv := api.NewServer(st, auth.NewMemoryNonceCache(), log)
+	if cfg.FirmwareDir != "" {
+		cat, err := firmware.Open(cfg.FirmwareDir)
+		if err != nil {
+			return err
+		}
+		srv.SetFirmware(cat)
+		log.Info("serving OTA releases", "dir", cfg.FirmwareDir)
+	}
 
 	httpSrv := &http.Server{
 		Addr:         cfg.Addr,
