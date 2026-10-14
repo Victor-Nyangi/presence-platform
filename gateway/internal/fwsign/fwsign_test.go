@@ -21,13 +21,15 @@ import (
 
 // The golden vector shared with firmware/test/host_test.cpp
 // (testSigningToolGoldenVector). It was produced once with a key generated in
-// memory and never written anywhere, so only the public half exists. If this
-// package ever signs something other than the raw image bytes, the firmware
-// side of the vector fails.
+// memory and never written anywhere, so only the public half exists. It signs
+// Preamble("1.2.3", 4099) followed by goldenImage(). If this package ever
+// signs anything else (the bare image, a hash, a different preamble), the
+// firmware side of the vector fails.
 const (
-	goldenPublicKey = "3cd093728d823e9acc0bff6a7d13fa56ebb1ec74919534be98cb7a0621dd1858"
-	goldenSignature = "5c4bcc9ae75f0e50435e512ff754ba38ba074890774fff7eabe74be5963b3415" +
-		"f7627f50e35ee73fb7b80137a92228bbaf3b864592b325064ba881bd8c247d08"
+	goldenVersion   = "1.2.3"
+	goldenPublicKey = "084dbbdd1f539f42a53792f892b2b6fd3d876c5ff6689420bb7d402ae51a28d9"
+	goldenSignature = "0a44e507c61010f4416b476813bb337b4cbcdd9f7845067a8c90a1401bf3bb1a" +
+		"11bfa94df02146f193932a021f506229479b024911a4930b590e9acebfcd2f0e"
 	goldenSHA256 = "85ba634afbe9acad2774ce77b6e5ac24b29d85cdaaef6bff544d87d548f50557"
 )
 
@@ -65,11 +67,16 @@ func pubOf(k ed25519.PrivateKey) ed25519.PublicKey { return k.Public().(ed25519.
 
 func TestGoldenVectorMatchesFirmware(t *testing.T) {
 	m := model.FirmwareManifest{
-		Available: true, Version: "0.0.0", URL: "https://x/y.bin",
+		Available: true, Version: goldenVersion,
 		Size: 4099, SHA256: goldenSHA256, Signature: goldenSignature,
 	}
 	if err := Verify(mustHex(t, goldenPublicKey), goldenImage(), m); err != nil {
 		t.Fatalf("golden vector does not verify: %v", err)
+	}
+	relabelled := m
+	relabelled.Version = "1.2.4"
+	if err := Verify(mustHex(t, goldenPublicKey), goldenImage(), relabelled); err == nil {
+		t.Fatal("golden image verified under a version it was not signed for")
 	}
 	bad := goldenImage()
 	bad[len(bad)-1] ^= 1
@@ -77,8 +84,78 @@ func TestGoldenVectorMatchesFirmware(t *testing.T) {
 	if err := Verify(mustHex(t, goldenPublicKey), bad, m); err == nil {
 		t.Fatal("tampered golden image verified")
 	}
-	if ed25519.Verify(mustHex(t, goldenPublicKey), bad, mustHex(t, goldenSignature)) {
+	if ed25519.Verify(mustHex(t, goldenPublicKey), signedMessage(goldenVersion, bad), mustHex(t, goldenSignature)) {
 		t.Fatal("tampered golden image verified at the primitive")
+	}
+}
+
+// The preamble bytes are a wire format shared with the firmware; pin them
+// literally rather than only through the vector.
+func TestPreambleBytes(t *testing.T) {
+	got := string(Preamble("0.2.0", 770992))
+	want := "presence-ota-image/v1\nversion=0.2.0\nsize=770992\n"
+	if got != want {
+		t.Fatalf("preamble %q, want %q", got, want)
+	}
+}
+
+// Downgrade protection rests on the version being covered by the signature.
+// An attacker holding a validly signed 0.1.0 manifest and image must not be
+// able to present them as 0.9.0.
+func TestVersionIsBoundIntoTheSignature(t *testing.T) {
+	priv := newKey(t)
+	old := bytes.Repeat([]byte("old firmware "), 3000)
+	m, err := Sign(priv, old, "0.1.0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(pubOf(priv), old, m); err != nil {
+		t.Fatal(err)
+	}
+	replay := m
+	replay.Version = "0.9.0"
+	if err := Verify(pubOf(priv), old, replay); err == nil {
+		t.Fatal("an old signed image verified under a newer version")
+	}
+
+	// A signature over the bare image (the scheme before versions were
+	// signed) must not verify either, or old manifests stay replayable.
+	bare := m
+	bare.Signature = hex.EncodeToString(ed25519.Sign(priv, old))
+	if err := Verify(pubOf(priv), old, bare); err == nil {
+		t.Fatal("a bare-image signature verified")
+	}
+}
+
+func TestImageVersionMarker(t *testing.T) {
+	build := func(parts ...string) []byte {
+		var b []byte
+		b = append(b, bytes.Repeat([]byte{0xE9, 0x00}, 64)...)
+		for _, p := range parts {
+			b = append(b, p...)
+			b = append(b, 0, 0xFF, 0x13)
+		}
+		return b
+	}
+	if v, err := ImageVersion(build(VersionMarker + "0.2.0")); err != nil || v != "0.2.0" {
+		t.Fatalf("got %q, %v", v, err)
+	}
+	if v, err := ImageVersion(build(VersionMarker+"0.2.0", VersionMarker+"0.2.0")); err != nil || v != "0.2.0" {
+		t.Fatalf("a repeated identical marker: %q, %v", v, err)
+	}
+	for name, img := range map[string][]byte{
+		"no marker":       build("presence terminal"),
+		"two versions":    build(VersionMarker+"0.2.0", VersionMarker+"0.3.0"),
+		"not a version":   build(VersionMarker + "0.2.0-dev"),
+		"unterminated":    append(build(), []byte(VersionMarker+"0.2.0")...),
+		"absurdly long":   build(VersionMarker + strings.Repeat("1", 40)),
+		"empty version":   build(VersionMarker),
+		"leading zero":    build(VersionMarker + "0.02.0"),
+		"bare prefix end": []byte(VersionMarker),
+	} {
+		if v, err := ImageVersion(img); err == nil {
+			t.Errorf("%s: accepted %q", name, v)
+		}
 	}
 }
 
@@ -94,6 +171,15 @@ func TestSignThenVerify(t *testing.T) {
 	}
 	if err := Verify(pubOf(priv), img, m); err != nil {
 		t.Fatal(err)
+	}
+
+	// Gateway-hosted: no URL, and the signature does not depend on it.
+	hosted, err := Sign(priv, img, "0.2.0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hosted.URL != "" || hosted.Signature != m.Signature {
+		t.Fatalf("the URL leaked into the signature, or was invented: %+v", hosted)
 	}
 }
 
@@ -145,10 +231,12 @@ func hexSHA(b []byte) string {
 func TestSignRefusesBadInput(t *testing.T) {
 	priv := newKey(t)
 	for name, f := range map[string]func() error{
-		"empty image":  func() error { _, err := Sign(priv, nil, "1", "https://x"); return err },
-		"no version":   func() error { _, err := Sign(priv, []byte{1}, "", "https://x"); return err },
-		"long version": func() error { _, err := Sign(priv, []byte{1}, strings.Repeat("9", 33), "https://x"); return err },
-		"ftp url":      func() error { _, err := Sign(priv, []byte{1}, "1", "ftp://x"); return err },
+		"empty image":      func() error { _, err := Sign(priv, nil, "1.0.0", "https://x"); return err },
+		"no version":       func() error { _, err := Sign(priv, []byte{1}, "", "https://x"); return err },
+		"long version":     func() error { _, err := Sign(priv, []byte{1}, strings.Repeat("9", 33), "https://x"); return err },
+		"two-part version": func() error { _, err := Sign(priv, []byte{1}, "1.0", "https://x"); return err },
+		"dev suffix":       func() error { _, err := Sign(priv, []byte{1}, "0.0.0-dev", "https://x"); return err },
+		"ftp url":          func() error { _, err := Sign(priv, []byte{1}, "1.0.0", "ftp://x"); return err },
 	} {
 		if f() == nil {
 			t.Errorf("%s: signed anyway", name)

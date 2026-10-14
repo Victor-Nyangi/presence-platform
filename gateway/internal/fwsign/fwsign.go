@@ -1,16 +1,21 @@
 // Package fwsign signs firmware images for the terminal's OTA channel.
 //
 // SPEC §3: OTA is a security boundary. A terminal boots a new image only if
-// a detached Ed25519 signature over the image's exact bytes verifies against
-// the public key compiled into its current firmware
-// (firmware/src/ota_pubkey.h). This package is the other half: it holds the
-// private key for exactly as long as it takes to sign, and emits the
-// manifest the gateway serves from GET /v1/device/firmware.
+// a detached Ed25519 signature verifies against the public key compiled into
+// its current firmware (firmware/src/ota_pubkey.h). This package is the other
+// half: it holds the private key for exactly as long as it takes to sign, and
+// emits the manifest the gateway serves from GET /v1/device/firmware.
+//
+// What is signed is Preamble(version, size) followed by the image's exact
+// bytes. Signing the version is what gives the terminal downgrade
+// protection: it refuses any image whose signed version is not newer than
+// what it runs, and a validly signed old image cannot be relabelled as new
+// without breaking the signature.
 //
 // Pure Ed25519 (RFC 8032), not Ed25519ph and not a signature over the
-// sha256: the firmware streams the image through SHA-512 itself, so it needs
-// no prehash variant, and the sha256 in the manifest is an integrity check
-// for a corrupt download, not the thing that is trusted.
+// sha256: the firmware streams the message through SHA-512 itself, so it
+// needs no prehash variant, and the sha256 in the manifest is an integrity
+// check for a corrupt download, not the thing that is trusted.
 //
 // The private key never belongs in a repository. See docs/ota-signing.md.
 package fwsign
@@ -31,8 +36,63 @@ import (
 	"regexp"
 	"strings"
 
+	"presence/internal/fwversion"
 	"presence/internal/model"
 )
+
+// PreambleTag starts every signed message. It doubles as domain separation:
+// a signature over a bare image (the scheme before versions were signed)
+// does not verify under this one.
+const PreambleTag = "presence-ota-image/v1\n"
+
+// Preamble is the signed text that precedes the image bytes. It must match
+// otaSignedPreamble in firmware/src/ota_verify.h byte for byte; the golden
+// vector in fwsign_test.go and host_test.cpp pins the two.
+func Preamble(version string, size int64) []byte {
+	return []byte(fmt.Sprintf("%sversion=%s\nsize=%d\n", PreambleTag, version, size))
+}
+
+func signedMessage(version string, image []byte) []byte {
+	pre := Preamble(version, int64(len(image)))
+	msg := make([]byte, 0, len(pre)+len(image))
+	return append(append(msg, pre...), image...)
+}
+
+// VersionMarker prefixes the version string every build embeds
+// (kPresenceVersionMarker in firmware/src/main.cpp).
+const VersionMarker = "PRESENCE_FW_VERSION="
+
+// ImageVersion returns the version a firmware image says it was built as.
+// The release tool compares it with -version, so an image cannot be signed
+// under a version it does not run as: the terminal trusts the signed version,
+// and a mislabelled release would confuse every comparison after it.
+func ImageVersion(image []byte) (string, error) {
+	var found string
+	rest := image
+	for {
+		i := bytes.Index(rest, []byte(VersionMarker))
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len(VersionMarker):]
+		end := bytes.IndexByte(rest, 0)
+		if end < 0 || end > fwversion.MaxLen {
+			return "", errors.New("version marker is not NUL-terminated within 17 bytes")
+		}
+		v := string(rest[:end])
+		if found != "" && v != found {
+			return "", fmt.Errorf("image carries two version markers, %q and %q", found, v)
+		}
+		found = v
+	}
+	if found == "" {
+		return "", fmt.Errorf("image has no %s marker; is it a presence build from this tree?", VersionMarker)
+	}
+	if !fwversion.Valid(found) {
+		return "", fmt.Errorf("image version %q: %w", found, fwversion.ErrInvalid)
+	}
+	return found, nil
+}
 
 const pemType = "PRIVATE KEY" // PKCS#8, the same as `openssl genpkey -algorithm ed25519`
 
@@ -122,15 +182,20 @@ func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
 
 // Sign produces the manifest for image. It verifies its own signature before
 // returning, so a manifest that leaves this function is one a terminal
-// holding the matching public key will accept.
+// holding the matching public key will accept, provided version is newer
+// than what that terminal runs.
+//
+// url is empty for an image the gateway hosts (it fills in its own path when
+// it serves the manifest), or an absolute http(s) URL for one hosted
+// elsewhere. The URL is not signed; the image is.
 func Sign(priv ed25519.PrivateKey, image []byte, version, url string) (model.FirmwareManifest, error) {
 	switch {
 	case len(image) == 0:
 		return model.FirmwareManifest{}, errors.New("empty image")
-	case version == "" || len(version) > 32:
-		return model.FirmwareManifest{}, errors.New("version must be 1-32 characters")
-	case !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://"):
-		return model.FirmwareManifest{}, errors.New("url must be http(s)")
+	case !fwversion.Valid(version):
+		return model.FirmwareManifest{}, fmt.Errorf("version %q: %w", version, fwversion.ErrInvalid)
+	case url != "" && !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://"):
+		return model.FirmwareManifest{}, errors.New("url must be empty (gateway-hosted) or http(s)")
 	}
 	sum := sha256.Sum256(image)
 	m := model.FirmwareManifest{
@@ -139,7 +204,7 @@ func Sign(priv ed25519.PrivateKey, image []byte, version, url string) (model.Fir
 		URL:       url,
 		Size:      int64(len(image)),
 		SHA256:    hex.EncodeToString(sum[:]),
-		Signature: hex.EncodeToString(ed25519.Sign(priv, image)),
+		Signature: hex.EncodeToString(ed25519.Sign(priv, signedMessage(version, image))),
 	}
 	if err := Verify(priv.Public().(ed25519.PublicKey), image, m); err != nil {
 		return model.FirmwareManifest{}, fmt.Errorf("self-check failed: %w", err)
@@ -147,9 +212,11 @@ func Sign(priv ed25519.PrivateKey, image []byte, version, url string) (model.Fir
 	return m, nil
 }
 
-// Verify applies the terminal's checks to an image and its manifest: size,
-// sha256, then the Ed25519 signature. Release scripts run it against the
-// public key in ota_pubkey.h before publishing anything.
+// Verify applies the terminal's checks to an image and its manifest: version
+// grammar, size, sha256, then the Ed25519 signature over the preamble and
+// the image. It cannot check "newer than the running build"; only a terminal
+// knows that. Release scripts run it against the public key in ota_pubkey.h
+// before publishing anything.
 func Verify(pub ed25519.PublicKey, image []byte, m model.FirmwareManifest) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return errors.New("public key is not 32 bytes")
@@ -159,6 +226,9 @@ func Verify(pub ed25519.PublicKey, image []byte, m model.FirmwareManifest) error
 	}
 	if len(image) == 0 {
 		return errors.New("empty image")
+	}
+	if !fwversion.Valid(m.Version) {
+		return fmt.Errorf("manifest version %q: %w", m.Version, fwversion.ErrInvalid)
 	}
 	if m.Size != int64(len(image)) {
 		return fmt.Errorf("manifest size %d, image is %d bytes", m.Size, len(image))
@@ -171,7 +241,7 @@ func Verify(pub ed25519.PublicKey, image []byte, m model.FirmwareManifest) error
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return errors.New("signature is not 128 hex characters")
 	}
-	if !ed25519.Verify(pub, image, sig) {
+	if !ed25519.Verify(pub, signedMessage(m.Version, image), sig) {
 		return errors.New("signature does not verify")
 	}
 	return nil

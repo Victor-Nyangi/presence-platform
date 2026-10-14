@@ -31,9 +31,15 @@
 //                        FEEDBACK ────────────────────┘
 //
 //   OTA (net task, scanning continues throughout):
-//     manifest ──► download to the idle slot ──► read it back ──►
-//     sha256 + Ed25519 against the compiled-in key ──► set boot ──► reboot
+//     manifest ──► newer than running AND floor? ──► download to the idle slot
+//     ──► read it back ──► sha256 + Ed25519 (preamble with the version, then
+//     the image) ──► record pending in NVS ──► set boot ──► reboot
 //     Any failure leaves the boot partition alone, so the running image stays.
+//
+//   After the reboot the new image is PENDING_VERIFY. The first successful
+//   heartbeat marks it valid and raises the version floor; no heartbeat within
+//   the confirm window, a crash or a power cut reboots it unconfirmed and the
+//   bootloader falls back to the previous slot. See ota_guard.h.
 
 #include <Arduino.h>
 #include <Adafruit_Fingerprint.h>
@@ -47,17 +53,35 @@
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
 
+#include <algorithm>
 #include <memory>
 #include <new>
 
 #include "canonical.h"
 #include "events_json.h"
 #include "littlefs_storage.h"
+#include "ota_guard.h"
 #include "ota_pubkey.h"
 #include "ota_verify.h"
 #include "ring_buffer.h"
 
+// The version, as a marker `fwsign sign` finds in the image and compares with
+// its -version flag. The signed version is what the terminal trusts, so a
+// release signed as 0.3.0 that is really a 0.2.0 build would confuse every
+// comparison after it; fwsign refuses to sign one. kFirmwareVersion points
+// into this array, so the linker cannot drop it.
+extern "C" const char kPresenceVersionMarker[];
+extern "C" const char kPresenceVersionMarker[] = "PRESENCE_FW_VERSION=" FIRMWARE_VERSION;
+
+// Arduino's initArduino() marks a PENDING_VERIFY image valid before setup()
+// runs unless the sketch defines this hook to return true. Defining it hands
+// that decision to OtaGuard: valid only after the first good heartbeat. (The
+// bootloader in this core is built with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE.)
+extern "C" bool verifyRollbackLater() { return true; }
+
 namespace {
+
+const char* kFirmwareVersion = kPresenceVersionMarker + sizeof("PRESENCE_FW_VERSION=") - 1;
 
 // --- pins / hardware -------------------------------------------------
 constexpr int kFingerprintRX = 16;
@@ -75,12 +99,22 @@ constexpr uint32_t kBackoffMinMs = 5'000;
 constexpr uint32_t kBackoffMaxMs = 300'000;
 
 // From platformio.ini's -DFIRMWARE_VERSION, so the version a build reports
-// (heartbeat, OTA manifest comparison) is the one it was built as.
+// (heartbeat, OTA comparison) is the one it was built as. It must be
+// MAJOR.MINOR.PATCH: downgrade protection compares it numerically, and a
+// build whose version cannot be compared does not compile.
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "0.0.0-dev"
+#define FIRMWARE_VERSION "0.0.0"
 #endif
-const char* kFirmwareVersion = FIRMWARE_VERSION;
+static_assert(presence::otaVersionCodeLiteral(FIRMWARE_VERSION) != presence::kInvalidOtaVersion,
+              "FIRMWARE_VERSION must be MAJOR.MINOR.PATCH (docs/ota-signing.md)");
 const char* kApiBase = "https://api.example.com";
+
+// How long a freshly installed image has to reach the gateway before it is
+// rolled back. Heartbeats run every 60 s and back off to 5 min on failure, so
+// ten minutes is several attempts. The bench env shortens it.
+#ifndef PRESENCE_OTA_CONFIRM_MS
+#define PRESENCE_OTA_CONFIRM_MS 600000
+#endif
 
 enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
 
@@ -112,6 +146,47 @@ bool g_firmwareAvailable = false;
 // Transport failures are not recorded here; those are worth retrying.
 uint8_t g_otaRejectedSha[presence::kSha256Bytes] = {};
 bool g_otaRejected = false;
+
+// OtaGuard's two bindings. The decisions are in ota_guard.h, under host test.
+class NvsOtaStateStore : public presence::OtaStateStore {
+ public:
+  bool load(presence::OtaPersistedState* out) override {
+    if (!g_nvs.isKey("ota_state") || g_nvs.getBytesLength("ota_state") != sizeof(*out)) return false;
+    return g_nvs.getBytes("ota_state", out, sizeof(*out)) == sizeof(*out);
+  }
+  bool save(const presence::OtaPersistedState& s) override {
+    return g_nvs.putBytes("ota_state", &s, sizeof(s)) == sizeof(s);
+  }
+};
+
+class EspBootControl : public presence::OtaBootControl {
+ public:
+  bool markValid() override { return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK; }
+  void rollback() override {
+    Serial.println("OTA: new image not confirmed in time, rolling back to the previous one");
+    Serial.flush();
+    // Reboots when otadata names a previous slot. On the first update after a
+    // USB flash it does not (the flashed slot has no otadata entry yet), and
+    // this returns ESP_ERR_OTA_ROLLBACK_FAILED. Rebooting anyway is the same
+    // rollback: this image is still PENDING_VERIFY, so the bootloader marks it
+    // ABORTED and, with no other entry, boots ota_0, which holds the old image.
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    esp_restart();
+  }
+};
+
+NvsOtaStateStore g_otaStore;
+EspBootControl g_bootControl;
+presence::OtaGuard g_otaGuard(&g_otaStore, &g_bootControl, PRESENCE_OTA_CONFIRM_MS);
+
+// Serialises OtaGuard and applyOta between the net task and, in the bench
+// build, the serial loader in loop(): two updates writing the idle slot at
+// once would corrupt each other.
+SemaphoreHandle_t g_otaMutex = nullptr;
+struct OtaLock {
+  OtaLock() { xSemaphoreTake(g_otaMutex, portMAX_DELAY); }
+  ~OtaLock() { xSemaphoreGive(g_otaMutex); }
+};
 
 // --------------------------------------------------------------------
 // Sequence numbers
@@ -462,6 +537,9 @@ bool flushEvents() {
 //   runs, otadata still points at the running image. Every failure path
 //   returns before it, and erases the head of the rejected slot so nothing
 //   (rollback included) can ever select it.
+// - THE DOWNGRADE CHECK COMES FIRST, the pending record just before the
+//   commit (ota_guard.h). The version checked is the one the signature covers,
+//   so a replayed old image cannot claim to be new.
 // --------------------------------------------------------------------
 enum class OtaOutcome { Applied, Transient, Rejected };
 
@@ -484,13 +562,21 @@ void invalidateSlot(const esp_partition_t* slot) {
 // each chunk is written. The bench serial loader uses it for flow control:
 // flash erases and writes stall interrupts that are not in IRAM, the UART's
 // among them, so bytes sent during one would overflow the 128-byte FIFO.
-OtaResult applyOta(Stream& in, size_t size, const uint8_t sha256[presence::kSha256Bytes],
+OtaResult applyOta(Stream& in, const std::string& version, size_t size,
+                   const uint8_t sha256[presence::kSha256Bytes],
                    const uint8_t signature[presence::kEd25519SignatureBytes], void (*ready)()) {
+  OtaLock lock;  // one update at a time
   // Refuse before erasing anything: with no key, nothing can ever verify.
   if (presence::isUnprovisionedKey(presence::kOtaReleasePublicKey)) {
     return {OtaOutcome::Rejected, "no release key compiled in"};
   }
   if (size == 0) return {OtaOutcome::Rejected, "empty image"};
+  // Older, equal, at or below the floor, rolled back once, or arriving while
+  // this image is itself unconfirmed: refused before a byte is erased.
+  const presence::OtaCandidate candidate = g_otaGuard.check(version, sha256);
+  if (candidate != presence::OtaCandidate::Accept) {
+    return {OtaOutcome::Rejected, presence::otaCandidateName(candidate)};
+  }
 
   const esp_partition_t* slot = esp_ota_get_next_update_partition(nullptr);
   if (slot == nullptr) return {OtaOutcome::Rejected, "no idle OTA slot"};
@@ -529,7 +615,7 @@ OtaResult applyOta(Stream& in, size_t size, const uint8_t sha256[presence::kSha2
     return {OtaOutcome::Rejected, "not a valid app image"};
   }
 
-  presence::ImageVerifier verifier(presence::kOtaReleasePublicKey, signature, size);
+  presence::ImageVerifier verifier(presence::kOtaReleasePublicKey, signature, version, size);
   mbedtls_sha256_context sha;
   mbedtls_sha256_init(&sha);
   mbedtls_sha256_starts_ret(&sha, 0);
@@ -557,8 +643,14 @@ OtaResult applyOta(Stream& in, size_t size, const uint8_t sha256[presence::kSha2
     return {OtaOutcome::Rejected, presence::otaVerdictName(verdict)};
   }
 
-  // The commit. Only a verified image gets here.
+  // Pending record BEFORE the commit, so a rollback is always noticed.
+  if (!g_otaGuard.notePending(version, sha256)) {
+    invalidateSlot(slot);
+    return {OtaOutcome::Transient, "could not record the pending update in NVS"};
+  }
+  // The commit. Only a verified, newer image gets here.
   if (esp_ota_set_boot_partition(slot) != ESP_OK) {
+    g_otaGuard.clearPending();
     invalidateSlot(slot);
     return {OtaOutcome::Transient, "esp_ota_set_boot_partition failed"};
   }
@@ -591,18 +683,37 @@ bool checkFirmware() {
     log_e("OTA: malformed manifest ignored");
     return false;
   }
-  if (!m.available || m.version == kFirmwareVersion) {
+  if (!m.available) {
     g_firmwareAvailable = false;
     return true;
   }
   if (g_otaRejected && memcmp(m.sha256, g_otaRejectedSha, sizeof(g_otaRejectedSha)) == 0) {
     return true;  // already refused this exact image; wait for a new one
   }
+  presence::OtaCandidate candidate;
+  {
+    OtaLock lock;
+    candidate = g_otaGuard.check(m.version, m.sha256);
+  }
+  if (candidate != presence::OtaCandidate::Accept) {
+    // Not an error: the gateway does not know this terminal's floor.
+    log_i("OTA: %s not taken: %s", m.version.c_str(), presence::otaCandidateName(candidate));
+    g_firmwareAvailable = false;
+    return true;
+  }
 
-  // The image URL is fetched unauthenticated and possibly over plain HTTP:
-  // its integrity comes from the signature, not the transport.
+  // A gateway-hosted image is a path on the API base, downloaded with the
+  // same HMAC signature as every other device call. An absolute URL (an image
+  // hosted elsewhere) is fetched unauthenticated, possibly over plain HTTP.
+  // Either way the image's integrity comes from the signature, not the
+  // transport.
   HTTPClient http;
-  http.begin(m.url.c_str());
+  if (presence::otaUrlIsGatewayPath(m.url)) {
+    http.begin(String(kApiBase) + m.url.c_str());
+    addAuthHeaders(http, "GET", m.url.c_str(), std::string());
+  } else {
+    http.begin(m.url.c_str());
+  }
   http.setTimeout(15000);
   const int got = http.GET();
   if (got != 200) {
@@ -615,7 +726,8 @@ bool checkFirmware() {
     log_e("OTA: Content-Length %d does not match manifest size", contentLength);
     return false;
   }
-  const OtaResult r = applyOta(*http.getStreamPtr(), static_cast<size_t>(m.size), m.sha256, m.signature, nullptr);
+  const OtaResult r =
+      applyOta(*http.getStreamPtr(), m.version, static_cast<size_t>(m.size), m.sha256, m.signature, nullptr);
   http.end();
 
   if (r.outcome == OtaOutcome::Applied) rebootIntoNewImage();
@@ -633,37 +745,70 @@ bool checkFirmware() {
 // signature gate can be proven on a board before the gateway serves
 // manifests. Built into esp32dev-debug only. It is no weaker than the
 // network path -- the image still has to verify against the compiled-in
-// key -- and anyone at the USB port can already reflash with esptool.
+// key and pass the downgrade check -- and anyone at the USB port can
+// already reflash with esptool.
 //
 // Protocol (firmware/tools/serial_ota.py speaks it):
-//   host:   OTA <size> <sha256-hex> <signature-hex>\n
+//   host:   OTA <version> <size> <sha256-hex> <signature-hex>\n
 //   device: OTA NEXT            (send the next 4096 bytes; repeats per chunk)
 //   device: OTA OK              then reboots into the new image
 //   device: OTA REJECT <reason> and keeps running the current image
+//   host:   OTA STATUS\n        device: OTA STATUS running=.. floor=.. awaiting=.. pending=.. bad=..
+//   host:   OTA HEALTHY\n       stands in for the first good heartbeat, which
+//                               a bench board with no Wi-Fi never gets:
+//                               device: OTA CONFIRMED running=.. floor=.. ...
 void benchAck() { Serial.println("OTA NEXT"); }
+
+void benchStatus(const char* tag) {
+  OtaLock lock;
+  const presence::OtaPersistedState& st = g_otaGuard.state();
+  Serial.printf("OTA %s running=%s floor=%s awaiting=%d pending=%s bad=%s\n", tag, kFirmwareVersion,
+                presence::formatOtaVersion(g_otaGuard.floor()).c_str(), g_otaGuard.awaitingConfirm() ? 1 : 0,
+                st.hasPending ? presence::formatOtaVersion(st.pendingVersion).c_str() : "-",
+                st.hasBad ? presence::toHex(st.badSha, 4).c_str() : "-");
+}
 
 void benchSerialOta() {
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n');
   line.trim();
+  if (line == "OTA STATUS") {
+    benchStatus("STATUS");
+    return;
+  }
+  if (line == "OTA HEALTHY") {
+    {
+      OtaLock lock;
+      g_otaGuard.onHealthy();
+    }
+    benchStatus(g_otaGuard.healthy() ? "CONFIRMED" : "NOT-CONFIRMED");
+    return;
+  }
   if (!line.startsWith("OTA ")) return;
 
-  const int a = line.indexOf(' ', 4);
-  const int b = a < 0 ? -1 : line.indexOf(' ', a + 1);
-  if (a < 0 || b < 0) {
-    Serial.println("OTA REJECT malformed header");
-    return;
+  // OTA <version> <size> <sha256> <signature>
+  String field[4];
+  int from = 4;
+  for (int i = 0; i < 4; i++) {
+    const int sp = line.indexOf(' ', from);
+    if (i < 3 && sp < 0) {
+      Serial.println("OTA REJECT malformed header");
+      return;
+    }
+    field[i] = i < 3 ? line.substring(from, sp) : line.substring(from);
+    from = sp + 1;
   }
-  const long size = line.substring(4, a).toInt();
+  const std::string version = field[0].c_str();
+  const long size = field[1].toInt();
   uint8_t sha[presence::kSha256Bytes];
   uint8_t sig[presence::kEd25519SignatureBytes];
-  if (size <= 0 || !presence::decodeHexExact(line.substring(a + 1, b).c_str(), sha, sizeof(sha)) ||
-      !presence::decodeHexExact(line.substring(b + 1).c_str(), sig, sizeof(sig))) {
+  if (size <= 0 || !presence::decodeHexExact(field[2].c_str(), sha, sizeof(sha)) ||
+      !presence::decodeHexExact(field[3].c_str(), sig, sizeof(sig))) {
     Serial.println("OTA REJECT malformed header");
     return;
   }
 
-  const OtaResult r = applyOta(Serial, static_cast<size_t>(size), sha, sig, benchAck);
+  const OtaResult r = applyOta(Serial, version, static_cast<size_t>(size), sha, sig, benchAck);
   if (r.outcome == OtaOutcome::Applied) {
     Serial.println("OTA OK");
     rebootIntoNewImage();
@@ -672,13 +817,46 @@ void benchSerialOta() {
 }
 #endif
 
+// confirmHealthy: the gateway answered, so this image works. Marks a pending
+// image valid and raises the version floor (ota_guard.h).
+void confirmHealthy() {
+  OtaLock lock;
+  const bool wasAwaiting = g_otaGuard.awaitingConfirm();
+  g_otaGuard.onHealthy();
+  if (wasAwaiting && !g_otaGuard.awaitingConfirm()) {
+    Serial.printf("OTA: %s confirmed by a gateway heartbeat; version floor %s\n", kFirmwareVersion,
+                  presence::formatOtaVersion(g_otaGuard.floor()).c_str());
+  }
+}
+
+// netSleep waits ms, but in one-second steps while an image awaits
+// confirmation, so the rollback deadline is kept to the second instead of
+// slipping by a whole backoff (up to five minutes with Wi-Fi down).
+void netSleep(uint32_t ms) {
+  while (ms > 0) {
+    const uint32_t step = g_otaGuard.awaitingConfirm() ? std::min<uint32_t>(ms, 1000) : ms;
+    vTaskDelay(pdMS_TO_TICKS(step));
+    ms -= step;
+    if (g_otaGuard.awaitingConfirm()) {
+      OtaLock lock;
+      g_otaGuard.tick(millis());
+    }
+  }
+}
+
 void netTask(void*) {
   uint32_t lastHeartbeat = 0, lastFlush = 0;
   for (;;) {
+    // Before the Wi-Fi check on purpose: an image that cannot bring up Wi-Fi
+    // is exactly the one that must roll back.
+    {
+      OtaLock lock;
+      g_otaGuard.tick(millis());  // reboots into the previous slot when the window has passed
+    }
     if (WiFi.status() != WL_CONNECTED) {
       // Scanning continues regardless; this is the whole point of the buffer.
       WiFi.reconnect();
-      vTaskDelay(pdMS_TO_TICKS(g_backoffMs));
+      netSleep(g_backoffMs);
       growBackoff();
       continue;
     }
@@ -688,7 +866,9 @@ void netTask(void*) {
     bool otaDue = false;
 
     if (now - lastHeartbeat > kHeartbeatMs) {
-      ok = sendHeartbeat() && ok;  // returns version counters; fetch deltas only when they move
+      const bool heartbeat = sendHeartbeat();  // returns version counters; fetch deltas only when they move
+      if (heartbeat) confirmHealthy();
+      ok = heartbeat && ok;
       lastHeartbeat = now;
       otaDue = g_firmwareAvailable;
     }
@@ -702,7 +882,7 @@ void netTask(void*) {
     if (otaDue) checkFirmware();  // reboots on success
 
     ok ? resetBackoff() : growBackoff();
-    vTaskDelay(pdMS_TO_TICKS(ok ? 1000 : g_backoffMs));
+    netSleep(ok ? 1000 : g_backoffMs);
   }
 }
 
@@ -727,6 +907,27 @@ void setup() {
   LittleFS.begin(true);
   g_nvs.begin("presence", false);
   g_seq = g_nvs.getULong64("seq", 0);
+
+  // OTA state before anything can fail: a new image must start its confirm
+  // window even if the sensor or the buffer then faults the terminal.
+  g_otaMutex = xSemaphoreCreateMutex();
+  bool pendingVerify = false;
+  esp_ota_img_states_t imgState;
+  if (running != nullptr && esp_ota_get_state_partition(running, &imgState) == ESP_OK) {
+    pendingVerify = imgState == ESP_OTA_IMG_PENDING_VERIFY;
+  }
+  switch (g_otaGuard.begin(kFirmwareVersion, pendingVerify, millis())) {
+    case presence::OtaBootKind::AwaitingConfirm:
+      Serial.printf("OTA: new image pending; rolls back unless the gateway answers within %u s\n",
+                    static_cast<unsigned>(g_otaGuard.confirmTimeoutMs() / 1000));
+      break;
+    case presence::OtaBootKind::RolledBack:
+      Serial.println("OTA: the last update did not stay booted; rolled back, and that image will not be retried");
+      break;
+    case presence::OtaBootKind::Normal:
+      break;
+  }
+  Serial.printf("OTA: version floor %s\n", presence::formatOtaVersion(g_otaGuard.floor()).c_str());
 
   Serial2.begin(57600, SERIAL_8N1, kFingerprintRX, kFingerprintTX);
   if (!g_finger.verifyPassword()) g_state = State::Fault;
