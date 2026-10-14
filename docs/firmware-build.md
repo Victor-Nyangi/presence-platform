@@ -25,9 +25,9 @@ value. The effective level was 5 before the edit and still is.
 
 | | `esp32dev` | `esp32dev-debug` |
 |---|---|---|
-| Flash (app) | **769,449 B (39.1% of the slot)**; 747,089 before OTA | **815,601 B (41.5%)**; 779,337 before OTA |
-| `firmware.bin` | **770,992 B**; 748,624 before OTA | 817,136 B |
-| Static RAM | 39,860 B of 327,680 (12.2%); 39,812 before OTA | 39,860 B |
+| Flash (app) | **773,869 B (39.4% of the slot)**; 769,449 before rollback, 747,089 before OTA | **822,745 B (41.8%)**; 815,601 before rollback, 779,337 before OTA |
+| `firmware.bin` | **775,408 B**; 770,992 before rollback, 748,624 before OTA | 824,288 B; 817,136 before rollback |
+| Static RAM | 39,996 B of 327,680 (12.2%); 39,860 before rollback, 39,812 before OTA | 39,996 B |
 
 **OTA verification (2026-10-14)** added 22,360 B of flash and 48 B of static RAM to `esp32dev`:
 Ed25519 verification and SHA-512 from vendored Monocypher 4.0.2 (about 11 KB of its symbols),
@@ -37,23 +37,32 @@ strings. Both envs still build with zero warnings. Same toolchain as below, Plat
 6.2.0. Nothing has run on a board, so the time an Ed25519 check over a ~770 KB image takes on
 the ESP32 is still unmeasured.
 
+**OTA downgrade protection and rollback (2026-10-14, later the same day)** added 4,420 B of
+flash and 136 B of static RAM to `esp32dev` (`firmware.bin` 770,992 → 775,408 B): the signed
+version preamble, `ota_guard.h`, the NVS binding, the boot-confirm hook and the signed image
+download. `esp32dev-debug` grew by 7,152 B (`firmware.bin` 817,136 → 824,288 B) with the bench
+`OTA STATUS`/`OTA HEALTHY` commands. Both envs build with zero warnings, clean builds, same
+toolchain.
+
 The ring cap (2026-10-11) added 180 B of flash and no static RAM.
 
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack
 
-The OTA app slot is `0x1E0000` = 1,966,080 B. **Free: 1,195,088 B, or 60.8% of the slot**
-(1,217,456 B / 61.9% before OTA verification).
+The OTA app slot is `0x1E0000` = 1,966,080 B. **Free: 1,190,672 B, or 60.6% of the slot**
+(1,195,088 B / 60.8% before downgrade protection and rollback, 1,217,456 B / 61.9% before OTA
+verification). `esp32dev-debug` leaves 1,141,792 B (58.1%).
 
-| Scheme | App slot | Free after the 770,992 B image | Filesystem |
+| Scheme | App slot | Free after the 775,408 B image | Filesystem |
 |---|---|---|---|
-| `min_spiffs.csv` (current) | 1,966,080 | 1,195,088 (60.8%) | 128 KiB |
-| custom, 2 × `0x180000` | 1,572,864 | 801,872 (51.0%) | 896 KiB |
-| `default.csv` | 1,310,720 | 539,728 (41.2%) | 1,408 KiB |
+| `min_spiffs.csv` (current) | 1,966,080 | 1,190,672 (60.6%) | 128 KiB |
+| custom, 2 × `0x180000` | 1,572,864 | 797,456 (50.7%) | 896 KiB |
+| `default.csv` | 1,310,720 | 535,312 (40.8%) | 1,408 KiB |
 
-Now in the image: OTA download, flash read-back, sha256 and Ed25519 verification
-(`docs/ota-signing.md`). Not yet in it, and all of these will grow it: command handling, Wi-Fi
+Now in the image: OTA download (signed, from the gateway), flash read-back, sha256 and
+Ed25519 verification over the version preamble and image, the downgrade floor and the
+boot-confirm rollback (`docs/ota-signing.md`). Not yet in it, and all of these will grow it: command handling, Wi-Fi
 bring-up, and the display/RFID drivers.
 
 ## Ring-buffer capacity

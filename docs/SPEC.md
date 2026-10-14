@@ -132,7 +132,7 @@ Response returns `ack_through`: the highest seq **in that batch** such that ever
 
 `GET /firmware` returns a manifest with `sha256` **and an Ed25519 signature** verified on-device against a public key compiled into the firmware. An unsigned OTA channel is a remote code execution channel into every hospital and school you've deployed to. Build the signing into your release script from day one; retrofitting it means physically touching every device.
 
-The signature is pure Ed25519 over the image's exact bytes, checked from the bytes read back out of the idle OTA slot, and `esp_ota_set_boot_partition` runs only after it passes. The signing tool is `gateway/cmd/fwsign`, and the verifier is `firmware/src/ota_verify.h` on vendored Monocypher. **Where the private key lives, how releases are signed and how to rotate the key: [`ota-signing.md`](ota-signing.md).**
+The signature is pure Ed25519 over a short preamble carrying the version and size, followed by the image's exact bytes. It is checked from the bytes read back out of the idle OTA slot, and `esp_ota_set_boot_partition` runs only after it passes. Because the version is signed, the terminal can refuse downgrades: it installs only a version newer than the build it runs and than the highest version that has proved healthy on it (a floor in NVS). A new image boots unconfirmed and is marked valid only after its first successful heartbeat; if it cannot reach the gateway within the confirm window, the terminal reboots into the previous image. An image that cannot phone home can never be fixed over the air, so that check is the one that matters. The signing tool is `gateway/cmd/fwsign`, and the verifier is `firmware/src/ota_verify.h` on vendored Monocypher. **Where the private key lives, how releases are signed and how to rotate the key: [`ota-signing.md`](ota-signing.md).**
 
 ---
 
@@ -184,7 +184,8 @@ Two FreeRTOS tasks. **The scan loop never blocks on the network** — this is th
 
    Side states, entered from READY on command:
      ENROLL ──► capture ×2 ──► store slot ──► upload template ──► READY
-     OTA    ──► download ──► verify sha256 + Ed25519 ──► flash ──► reboot
+     OTA    ──► newer? ──► download ──► verify sha256 + Ed25519 ──► flash ──► reboot
+                ──► first heartbeat confirms it, else roll back to the previous image
      FAULT  ──► sensor/flash error; audible alert, retry with backoff
 ```
 
