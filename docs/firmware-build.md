@@ -25,26 +25,36 @@ value. The effective level was 5 before the edit and still is.
 
 | | `esp32dev` | `esp32dev-debug` |
 |---|---|---|
-| Flash (app) | 747,089 B (38.0% of the slot), was 746,909 | 779,337 B (39.6%), was 779,053 |
-| `firmware.bin` | 748,624 B, was 748,448 | — |
-| Static RAM | 39,812 B of 327,680 (12.1%), unchanged | 39,812 B |
+| Flash (app) | **769,449 B (39.1% of the slot)**; 747,089 before OTA | **815,601 B (41.5%)**; 779,337 before OTA |
+| `firmware.bin` | **770,992 B**; 748,624 before OTA | 817,136 B |
+| Static RAM | 39,860 B of 327,680 (12.2%); 39,812 before OTA | 39,860 B |
 
-The ring cap added 180 B of flash (`esp32dev`) and no static RAM. Both envs still build with zero
-warnings.
+**OTA verification (2026-10-14)** added 22,360 B of flash and 48 B of static RAM to `esp32dev`:
+Ed25519 verification and SHA-512 from vendored Monocypher 4.0.2 (about 11 KB of its symbols),
+plus the download, read-back and commit path in `main.cpp`. `esp32dev-debug` grew by 36,264 B,
+because it also carries the bench serial loader (`PRESENCE_BENCH_SERIAL_OTA`) and level-5 log
+strings. Both envs still build with zero warnings. Same toolchain as below, PlatformIO Core
+6.2.0. Nothing has run on a board, so the time an Ed25519 check over a ~770 KB image takes on
+the ESP32 is still unmeasured.
+
+The ring cap (2026-10-11) added 180 B of flash and no static RAM.
 
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack
 
-The OTA app slot is `0x1E0000` = 1,966,080 B. **Free: 1,217,456 B, or 61.9% of the slot.**
+The OTA app slot is `0x1E0000` = 1,966,080 B. **Free: 1,195,088 B, or 60.8% of the slot**
+(1,217,456 B / 61.9% before OTA verification).
 
-| Scheme | App slot | Free after the 748,624 B image | Filesystem |
+| Scheme | App slot | Free after the 770,992 B image | Filesystem |
 |---|---|---|---|
-| `min_spiffs.csv` (current) | 1,966,080 | 1,217,456 (61.9%) | 128 KiB |
-| custom, 2 × `0x180000` | 1,572,864 | 824,240 (52.4%) | 896 KiB |
-| `default.csv` | 1,310,720 | 562,096 (42.9%) | 1,408 KiB |
+| `min_spiffs.csv` (current) | 1,966,080 | 1,195,088 (60.8%) | 128 KiB |
+| custom, 2 × `0x180000` | 1,572,864 | 801,872 (51.0%) | 896 KiB |
+| `default.csv` | 1,310,720 | 539,728 (41.2%) | 1,408 KiB |
 
-Not yet in the image, and all of it will grow it: OTA download/verify, Ed25519, command handling, the display/RFID drivers.
+Now in the image: OTA download, flash read-back, sha256 and Ed25519 verification
+(`docs/ota-signing.md`). Not yet in it, and all of these will grow it: command handling, Wi-Fi
+bring-up, and the display/RFID drivers.
 
 ## Ring-buffer capacity
 

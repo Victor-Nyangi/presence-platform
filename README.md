@@ -160,14 +160,14 @@ The protocol-critical parts are deliberately free of Arduino headers so they com
 make firmware-test
 ```
 
-This covers the ring buffer (ack semantics, power-cut corruption, overflow, reboot recovery) and the canonical signing string. The signing format is pinned by the **same golden vector** in both `gateway/internal/auth/conformance_test.go` and `firmware/test/host_test.cpp` — if someone changes the format on one side only, CI fails instead of every deployed terminal returning 401 the morning after a release.
+This covers the ring buffer (ack semantics, power-cut corruption, overflow, reboot recovery), the canonical signing string, and the OTA signature gate (RFC 8032 vectors; tampered, truncated, wrong-key and empty images; manifest parsing). The signing format is pinned by the **same golden vector** in both `gateway/internal/auth/conformance_test.go` and `firmware/test/host_test.cpp` — if someone changes the format on one side only, CI fails instead of every deployed terminal returning 401 the morning after a release.
 
 ### First ESP32 build
 
 Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
 
-- **Size:** 747,089 B flash (38.0% of the app slot), 39,812 B static RAM (12.1%).
-- **OTA slack:** 1,217,456 B free in the 1,966,080 B OTA slot (61.9%). Under `default.csv` it would be 562,096 B (42.9%).
+- **Size:** 769,449 B flash (39.1% of the app slot), 39,860 B static RAM (12.2%), including Ed25519 OTA verification (+22,360 B, 2026-10-14).
+- **OTA slack:** 1,195,088 B free in the 1,966,080 B OTA slot (60.8%). Under `default.csv` it would be 539,728 B (41.2%).
 - **Buffer:** **953 records** under `min_spiffs`, 7,494 with a custom 896 KiB filesystem, 11,855 under `default` (was 1,911 / 15,018 / 23,756). littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks; the old size filled 31 of 32 blocks and the first `append()` failed with `LFS_ERR_NOSPC`, sending the terminal to `Fault`. `ringCapacityBytes` now derives the size from the filesystem geometry: `(blocks - metadata - 2 slack) / 2` ring blocks of `block_size - 8` bytes. Host emulation runs the new size through repeated full laps of appends with no `LFS_ERR_NOSPC`, at ~7.5 block erases per punch under `min_spiffs`.
 - **Pending on hardware:** the record count is still an estimate until a board prints its `punch buffer: N records` boot line (953 expected under `min_spiffs`), and punch latency from those erases has not been measured.
 
@@ -194,7 +194,7 @@ Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
 - [x] Outbound event emitter: projector, transactional outbox, signed delivery worker — see [`docs/events.md`](docs/events.md)
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
-- [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to
+- [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to. Verification, signing tool (`fwsign`) and key procedure are built and host-tested ([`docs/ota-signing.md`](docs/ota-signing.md)). Still open: a board run, the release key itself (`ota_pubkey.h` ships with an all-zero sentinel that refuses every update), and the gateway's `GET /v1/device/firmware`.
 - [ ] Admin UI over the review queue
 - [ ] Guardian notifications (Africa's Talking / WhatsApp)
 - [ ] HR and school-portal integrations
