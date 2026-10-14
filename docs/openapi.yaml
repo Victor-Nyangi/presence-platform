@@ -129,7 +129,13 @@ paths:
                   backoff_s:
                     type: integer
                     description: If present, wait this long before the next call.
-                  firmware_available: { type: boolean }
+                  firmware_available:
+                    type: boolean
+                    description: |
+                      True when the release published on this device's
+                      firmware channel is strictly newer than the
+                      `firmware_version` in this heartbeat. The device then
+                      calls `GET /v1/device/firmware`.
 
   /v1/device/events:
     post:
@@ -302,12 +308,28 @@ paths:
 
   /v1/device/firmware:
     get:
-      summary: OTA update manifest
+      summary: OTA update manifest for the device's channel
+      description: |
+        Returns the release published on the device's firmware channel
+        (`device.firmware_channel`, default `stable`) when it is strictly
+        newer than `current`; otherwise `{"available": false}`. The manifest
+        is the signer's output (`gateway/cmd/fwsign`) read from the gateway's
+        release directory; the gateway never signs, builds or alters an
+        image, and adds only `url`.
+
+        The terminal makes the final decision. It installs only an image
+        whose signed version is newer than the build it runs AND newer than
+        the highest version that has ever proved healthy on it (a floor kept
+        in NVS, which the gateway does not know), and that it has not rolled
+        back before. A new image must then reach the gateway with a
+        heartbeat within its confirm window, or the terminal reboots into
+        the previous one. Release and key handling: docs/ota-signing.md.
       parameters:
         - name: current
           in: query
           required: true
-          schema: { type: string }
+          description: The device's running firmware version.
+          schema: { $ref: "#/components/schemas/FirmwareVersion" }
       responses:
         "200":
           description: OK
@@ -318,9 +340,19 @@ paths:
                 required: [available]
                 properties:
                   available: { type: boolean }
-                  version: { type: string }
-                  url: { type: string, format: uri }
-                  size: { type: integer }
+                  version: { $ref: "#/components/schemas/FirmwareVersion" }
+                  url:
+                    type: string
+                    format: uri-reference
+                    description: |
+                      Where to download the image. The gateway always
+                      serves `/v1/device/firmware/images/{sha256}`, a path
+                      relative to the API base, which the device fetches
+                      with the same HMAC signature as any other call. The
+                      device also accepts an absolute http(s) URL for an
+                      image hosted elsewhere. The URL is not signed; the
+                      image is.
+                  size: { type: integer, minimum: 1 }
                   sha256:
                     type: string
                     pattern: "^[0-9a-f]{64}$"
@@ -333,13 +365,68 @@ paths:
                     pattern: "^[0-9a-f]{128}$"
                     description: |
                       Hex-encoded, detached Ed25519 signature (RFC 8032,
-                      pure Ed25519, not Ed25519ph) over the exact bytes
-                      served at `url`. Verified on-device against a public
-                      key burned into the firmware, from the bytes read back
-                      out of flash, before the image is made bootable.
-                      Without this, OTA is a remote code execution channel.
-                      Produced by gateway/cmd/fwsign; key handling in
+                      pure Ed25519, not Ed25519ph) over this preamble
+                      followed by the exact bytes of the image:
+
+                          presence-ota-image/v1\n
+                          version={version}\n
+                          size={size, decimal}\n
+
+                      Signing the version is what makes downgrade
+                      protection work: a validly signed old image cannot
+                      be presented under a newer version. Verified
+                      on-device against a public key burned into the
+                      firmware, from the bytes read back out of flash,
+                      before the image is made bootable. Without this, OTA
+                      is a remote code execution channel. Produced by
+                      gateway/cmd/fwsign; key handling in
                       docs/ota-signing.md.
+        "400":
+          description: "`current` missing or not MAJOR.MINOR.PATCH"
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "401":
+          description: Signature or clock rejection
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/device/firmware/images/{sha256}:
+    get:
+      summary: Download a published firmware image
+      description: |
+        Streams an image from the gateway's release directory, where it is
+        stored under its own sha256. The gateway checks the file against
+        that name before sending a byte and never generates an image. The
+        device verifies the signature itself regardless, from flash.
+        Signed like every other device call; the body is empty, so the
+        signed body hash is that of the empty string.
+      parameters:
+        - name: sha256
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: The image bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: Signature or clock rejection
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "404":
+          description: No such image
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
 components:
 
@@ -372,6 +459,17 @@ components:
       name: X-Provision-Token
 
   schemas:
+
+    FirmwareVersion:
+      type: string
+      description: |
+        MAJOR.MINOR.PATCH, each 0-65535, no leading zeros, no pre-release
+        suffix. Versions are compared numerically, so this strictness is
+        what lets the signer, the gateway and the terminal agree on which
+        image is newer.
+      pattern: "^(0|[1-9][0-9]{0,4})[.](0|[1-9][0-9]{0,4})[.](0|[1-9][0-9]{0,4})$"
+      maxLength: 17
+      examples: ["0.2.0"]
 
     PunchEvent:
       type: object

@@ -81,6 +81,7 @@ Device-facing HTTPS. Devices poll; nothing needs an inbound firewall rule at a c
 | `POST /v1/device/events` | Batched, idempotent punch upload. |
 | `GET /v1/device/commands` | Enroll, reboot, config, firmware, revoke. |
 | `GET /v1/device/roster` | Slot → display name, so terminals greet people offline. |
+| `GET /v1/device/firmware` | Signed OTA manifest for the device's channel, when its release is newer. The image itself is `GET /v1/device/firmware/images/{sha256}`, also signed. |
 
 **Auth** is HMAC-SHA256 over a canonical string (see [`docs/openapi.yaml`](docs/openapi.yaml)). mTLS is stronger, but client-cert provisioning and rotation on an ESP32 is a real time sink; HMAC gives device identity, replay protection and rotation with far less machinery. Move to mTLS when you have an ops person.
 
@@ -97,6 +98,7 @@ Two details worth knowing before you touch this code:
 | `PRESENCE_KEKS` | required, `id:hex64[,id:hex64]`. Multiple entries let you rotate without re-encrypting everything at once. |
 | `PRESENCE_KEK_ID` | which key encrypts new writes |
 | `PRESENCE_TOKEN_PEPPER` | required |
+| `PRESENCE_FIRMWARE_DIR` | optional. Published OTA releases (`<channel>/manifest.json`, `images/<sha256>.bin`; see [`docs/ota-signing.md`](docs/ota-signing.md)). Unset: every device is told no update is available. Set but missing: the gateway refuses to start. |
 
 No defaults for secrets, deliberately: a gateway that silently boots with a development key in production is worse than one that refuses to start.
 
@@ -160,14 +162,14 @@ The protocol-critical parts are deliberately free of Arduino headers so they com
 make firmware-test
 ```
 
-This covers the ring buffer (ack semantics, power-cut corruption, overflow, reboot recovery), the canonical signing string, and the OTA signature gate (RFC 8032 vectors; tampered, truncated, wrong-key and empty images; manifest parsing). The signing format is pinned by the **same golden vector** in both `gateway/internal/auth/conformance_test.go` and `firmware/test/host_test.cpp` — if someone changes the format on one side only, CI fails instead of every deployed terminal returning 401 the morning after a release.
+This covers the ring buffer (ack semantics, power-cut corruption, overflow, reboot recovery), the canonical signing string, the OTA signature gate (RFC 8032 vectors; tampered, truncated, wrong-key, relabelled and empty images; manifest parsing), and OTA downgrade protection and rollback (older, equal and below-floor images refused, the floor surviving a reboot, rollback on a missed confirm or a power cut) against a simulated two-slot flash and bootloader. The signing format is pinned by the **same golden vector** in both `gateway/internal/auth/conformance_test.go` and `firmware/test/host_test.cpp` — if someone changes the format on one side only, CI fails instead of every deployed terminal returning 401 the morning after a release.
 
 ### First ESP32 build
 
 Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
 
-- **Size:** 769,449 B flash (39.1% of the app slot), 39,860 B static RAM (12.2%), including Ed25519 OTA verification (+22,360 B, 2026-10-14).
-- **OTA slack:** 1,195,088 B free in the 1,966,080 B OTA slot (60.8%). Under `default.csv` it would be 539,728 B (41.2%).
+- **Size:** 773,869 B flash (39.4% of the app slot), 39,996 B static RAM (12.2%), including Ed25519 OTA verification (+22,360 B) and downgrade protection and rollback (+4,420 B), both 2026-10-14.
+- **OTA slack:** 1,190,672 B free in the 1,966,080 B OTA slot (60.6%). Under `default.csv` it would be 535,312 B (40.8%).
 - **Buffer:** **953 records** under `min_spiffs`, 7,494 with a custom 896 KiB filesystem, 11,855 under `default` (was 1,911 / 15,018 / 23,756). littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks; the old size filled 31 of 32 blocks and the first `append()` failed with `LFS_ERR_NOSPC`, sending the terminal to `Fault`. `ringCapacityBytes` now derives the size from the filesystem geometry: `(blocks - metadata - 2 slack) / 2` ring blocks of `block_size - 8` bytes. Host emulation runs the new size through repeated full laps of appends with no `LFS_ERR_NOSPC`, at ~7.5 block erases per punch under `min_spiffs`.
 - **Pending on hardware:** the record count is still an estimate until a board prints its `punch buffer: N records` boot line (953 expected under `min_spiffs`), and punch latency from those erases has not been measured.
 
@@ -194,7 +196,7 @@ Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6
 - [x] Attendance engine: pairing, day boundary, amendments, review queue
 - [x] Outbound event emitter: projector, transactional outbox, signed delivery worker — see [`docs/events.md`](docs/events.md)
 - [ ] Provisioning flow (currently returns 501 rather than pretending to work)
-- [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to. Verification, signing tool (`fwsign`) and key procedure are built and host-tested ([`docs/ota-signing.md`](docs/ota-signing.md)). Still open: a board run, the release key itself (`ota_pubkey.h` ships with an all-zero sentinel that refuses every update), and the gateway's `GET /v1/device/firmware`.
+- [ ] OTA with Ed25519 verification — **before device #3 leaves the desk**; an unsigned OTA channel is remote code execution into every site you deploy to. Verification, downgrade protection, boot-confirm rollback, the signing tool (`fwsign`), the gateway's `GET /v1/device/firmware` and the key and release procedure are built and tested ([`docs/ota-signing.md`](docs/ota-signing.md)). Still open: a board run, Wi-Fi bring-up (no credentials or provisioning are specified, so the network path cannot run on a board yet), and the release key itself (`ota_pubkey.h` ships with an all-zero sentinel that refuses every update).
 - [ ] Admin UI over the review queue
 - [ ] Guardian notifications (Africa's Talking / WhatsApp)
 - [ ] HR and school-portal integrations
