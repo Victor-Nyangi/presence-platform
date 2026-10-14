@@ -321,13 +321,25 @@ paths:
                   version: { type: string }
                   url: { type: string, format: uri }
                   size: { type: integer }
-                  sha256: { type: string }
+                  sha256:
+                    type: string
+                    pattern: "^[0-9a-f]{64}$"
+                    description: |
+                      Hex-encoded SHA-256 of the image. An integrity check
+                      for a corrupt download; the signature is what is
+                      trusted.
                   signature:
                     type: string
+                    pattern: "^[0-9a-f]{128}$"
                     description: |
-                      Ed25519 signature over the image, verified on-device
-                      against a public key burned into the firmware. Without
-                      this, OTA is a remote code execution channel.
+                      Hex-encoded, detached Ed25519 signature (RFC 8032,
+                      pure Ed25519, not Ed25519ph) over the exact bytes
+                      served at `url`. Verified on-device against a public
+                      key burned into the firmware, from the bytes read back
+                      out of flash, before the image is made bootable.
+                      Without this, OTA is a remote code execution channel.
+                      Produced by gateway/cmd/fwsign; key handling in
+                      docs/ota-signing.md.
 
 components:
 

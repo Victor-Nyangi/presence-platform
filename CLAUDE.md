@@ -47,7 +47,7 @@ CI (`.github/workflows/ci.yml`) runs: schema + smoke test, `go vet`, a `gofmt -l
 - They also need `-p 1`. The `api` and `attendance` suites each `TRUNCATE` and re-seed the *same* database, so `go test`'s default package parallelism makes them clobber each other. Both `make test-integration` and CI pass the flag; dropping it makes the suite intermittently red.
 - Those tests `TRUNCATE` core tables on setup. Never point `PRESENCE_TEST_DATABASE_URL` at a database you care about.
 - `db/` is mounted as `/docker-entrypoint-initdb.d` in compose, so both SQL files run on first boot of an empty volume. `002_smoke_test.sql` ends in `ROLLBACK`, so it leaves no rows.
-- `firmware/test/host_test.cpp` is a single hand-rolled binary (no framework, no `-run` filter); it compiles only `crc32.cpp` alongside itself.
+- `firmware/test/host_test.cpp` is a single hand-rolled binary (no framework, no `-run` filter); it compiles `crc32.cpp` and the vendored Monocypher (`firmware/lib/monocypher`, built as C) alongside itself.
 
 ### Configuration
 
@@ -103,7 +103,7 @@ Breaking one of these looks like a small change and isn't:
 ### Known-incomplete surfaces
 
 - `POST /v1/device/provision` returns **501 on purpose** so it can't be mistaken for a working open endpoint. The installer flow isn't built.
-- OTA signature verification (Ed25519) is designed but not implemented; per SPEC this must land before a third device ships.
+- OTA: Ed25519 verification is implemented and host-tested (`firmware/src/ota_verify.h`, `applyOta` in `main.cpp`, signer `gateway/cmd/fwsign`) but **has not run on a board**. `firmware/src/ota_pubkey.h` holds the all-zero *unprovisioned* sentinel, which refuses every update; the release key goes there before a third device ships. The gateway does not serve `GET /v1/device/firmware` yet. Key handling is in `docs/ota-signing.md`. **Never commit a private key**: `fwsign keygen` refuses to write inside a git work tree.
 - Retention/consent/erasure for biometric data and the `audit_log` read-logging path are scaffolded only. See the README's *Before production* section — biometric data is regulated (Kenya DPA 2019) and this is not deployable to a real school or hospital yet.
 
 ### Firmware status
@@ -123,3 +123,5 @@ What *is* tested lives in `ring_buffer.h`, `canonical.h` and `events_json.h`, ke
 - **Both cursors go in one NVS entry.** `depth()` is unsigned subtraction, so a torn pair with the tail past the head does not fault — it underflows to ~1.8e19 and pins `full()` true, quietly evicting a good record on every punch. `RingBuffer::begin` clamps such a pair as defence in depth.
 
 `PunchRecord` is a 60-byte packed POD with a `static_assert` on its size — changing the layout is a storage format break.
+
+**OTA ordering rules** (`applyOta`): verify the image *read back from the idle slot*, not the bytes as they arrived; `esp_ota_set_boot_partition` is the commit and runs only after sha256 and Ed25519 both pass; every failure erases the head of the rejected slot and leaves the running image as the boot partition. The signature is pure Ed25519 over the raw image bytes, and a golden vector in both `host_test.cpp` and `gateway/internal/fwsign/fwsign_test.go` pins the tool to the firmware. `firmware/lib/monocypher` is vendored unmodified (see `VENDORED`). Do not edit it. Upgrade it by replacing it.

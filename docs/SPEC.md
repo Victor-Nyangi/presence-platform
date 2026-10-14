@@ -132,6 +132,8 @@ Response returns `ack_through`: the highest seq **in that batch** such that ever
 
 `GET /firmware` returns a manifest with `sha256` **and an Ed25519 signature** verified on-device against a public key compiled into the firmware. An unsigned OTA channel is a remote code execution channel into every hospital and school you've deployed to. Build the signing into your release script from day one; retrofitting it means physically touching every device.
 
+The signature is pure Ed25519 over the image's exact bytes, checked from the bytes read back out of the idle OTA slot, and `esp_ota_set_boot_partition` runs only after it passes. The signing tool is `gateway/cmd/fwsign`, and the verifier is `firmware/src/ota_verify.h` on vendored Monocypher. **Where the private key lives, how releases are signed and how to rotate the key: [`ota-signing.md`](ota-signing.md).**
+
 ---
 
 ## 4. Failure scenarios, walked
