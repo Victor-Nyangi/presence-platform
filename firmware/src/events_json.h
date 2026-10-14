@@ -323,4 +323,78 @@ inline int64_t parseAckThrough(const char* json) {
   return v;
 }
 
+// jsonValueStart returns the index of the first non-space character after
+// `"key":`, or npos. The key-matching rule is parseJsonInt's: a complete
+// quoted token followed by a colon, so a key name appearing as a string
+// value is skipped.
+inline size_t jsonValueStart(const std::string& hay, const char* key) {
+  const std::string needle = std::string("\"") + key + "\"";
+  size_t pos = 0;
+  while ((pos = hay.find(needle, pos)) != std::string::npos) {
+    size_t i = pos + needle.size();
+    while (i < hay.size() && (hay[i] == ' ' || hay[i] == '\t' || hay[i] == '\n' || hay[i] == '\r')) i++;
+    if (i >= hay.size() || hay[i] != ':') {
+      pos += needle.size();
+      continue;
+    }
+    i++;
+    while (i < hay.size() && (hay[i] == ' ' || hay[i] == '\t' || hay[i] == '\n' || hay[i] == '\r')) i++;
+    return i < hay.size() ? i : std::string::npos;
+  }
+  return std::string::npos;
+}
+
+// parseJsonBool extracts a literal true/false by key.
+inline bool parseJsonBool(const char* json, const char* key, bool* out) {
+  if (json == nullptr || key == nullptr || out == nullptr) return false;
+  const std::string hay(json);
+  const size_t i = jsonValueStart(hay, key);
+  if (i == std::string::npos) return false;
+  if (hay.compare(i, 4, "true") == 0) {
+    *out = true;
+    return true;
+  }
+  if (hay.compare(i, 5, "false") == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+// parseJsonString extracts a string value by key, refusing anything longer
+// than maxLen. Only the escapes a URL, version or hex digest can plausibly
+// need are decoded (\" \\ \/). Anything else -- \uXXXX, control characters --
+// fails the parse rather than being guessed at: every caller treats a failed
+// parse as "ignore this response", which is the safe direction for an OTA
+// manifest. (Go's encoding/json writes & as \u0026 unless the encoder is told
+// not to; the signing tool's encoder is.)
+inline bool parseJsonString(const char* json, const char* key, std::string* out, size_t maxLen) {
+  if (json == nullptr || key == nullptr || out == nullptr) return false;
+  const std::string hay(json);
+  size_t i = jsonValueStart(hay, key);
+  if (i == std::string::npos || hay[i] != '"') return false;
+  i++;
+  std::string value;
+  while (i < hay.size()) {
+    const char c = hay[i];
+    if (c == '"') {
+      *out = value;
+      return true;
+    }
+    if (static_cast<unsigned char>(c) < 0x20) return false;
+    if (c == '\\') {
+      if (i + 1 >= hay.size()) return false;
+      const char e = hay[i + 1];
+      if (e != '"' && e != '\\' && e != '/') return false;
+      value.push_back(e);
+      i += 2;
+    } else {
+      value.push_back(c);
+      i++;
+    }
+    if (value.size() > maxLen) return false;
+  }
+  return false;  // unterminated
+}
+
 }  // namespace presence

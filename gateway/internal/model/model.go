@@ -224,3 +224,17 @@ type Problem struct {
 	Detail       string `json:"detail,omitempty"`
 	ServerTimeMS int64  `json:"server_time_ms,omitempty"`
 }
+
+// FirmwareManifest is the 200 body of GET /v1/device/firmware. Signature is
+// a hex-encoded, detached, pure Ed25519 (RFC 8032) signature over the exact
+// bytes served at URL; the terminal verifies it against the public key
+// compiled into its firmware before it will boot the image. cmd/fwsign
+// produces these; firmware/src/ota_verify.h parses them.
+type FirmwareManifest struct {
+	Available bool   `json:"available"`
+	Version   string `json:"version,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Size      int64  `json:"size,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}

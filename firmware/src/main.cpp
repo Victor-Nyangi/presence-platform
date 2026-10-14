@@ -29,6 +29,11 @@
 //                      BUFFER_WRITE ──fail──► FAULT ─┘
 //                            ▼
 //                        FEEDBACK ────────────────────┘
+//
+//   OTA (net task, scanning continues throughout):
+//     manifest ──► download to the idle slot ──► read it back ──►
+//     sha256 + Ed25519 against the compiled-in key ──► set boot ──► reboot
+//     Any failure leaves the boot partition alone, so the running image stays.
 
 #include <Arduino.h>
 #include <Adafruit_Fingerprint.h>
@@ -37,12 +42,19 @@
 #include <Preferences.h>
 #include <RTClib.h>
 #include <WiFi.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
+
+#include <memory>
+#include <new>
 
 #include "canonical.h"
 #include "events_json.h"
 #include "littlefs_storage.h"
+#include "ota_pubkey.h"
+#include "ota_verify.h"
 #include "ring_buffer.h"
 
 namespace {
@@ -62,7 +74,12 @@ constexpr size_t kMaxBatch = 50;
 constexpr uint32_t kBackoffMinMs = 5'000;
 constexpr uint32_t kBackoffMaxMs = 300'000;
 
-const char* kFirmwareVersion = "0.1.0";
+// From platformio.ini's -DFIRMWARE_VERSION, so the version a build reports
+// (heartbeat, OTA manifest comparison) is the one it was built as.
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "0.0.0-dev"
+#endif
+const char* kFirmwareVersion = FIRMWARE_VERSION;
 const char* kApiBase = "https://api.example.com";
 
 enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
@@ -87,6 +104,14 @@ bool g_rtcTrusted = false;
 // window is recorded raw and deduplicated server-side.
 uint16_t g_lastSlot = 0;
 uint32_t g_lastSlotAtMs = 0;
+
+// Set by the heartbeat, consumed by the net task.
+bool g_firmwareAvailable = false;
+// The sha256 of the last image that FAILED VERIFICATION, so a manifest that
+// keeps advertising a bad image costs one download, not one every minute.
+// Transport failures are not recorded here; those are worth retrying.
+uint8_t g_otaRejectedSha[presence::kSha256Bytes] = {};
+bool g_otaRejected = false;
 
 // --------------------------------------------------------------------
 // Sequence numbers
@@ -156,26 +181,43 @@ std::string randomUuid() {
   return presence::formatUuid(raw);
 }
 
-// signedPost returns the HTTP status, or a negative value on transport error.
-// path must NOT include a query string; the gateway signs the path alone.
-int signedPost(const char* path, const std::string& body, String* response) {
-  HTTPClient http;
-  http.begin(String(kApiBase) + path);
-  http.setTimeout(15000);
-
+// addAuthHeaders signs one request. path must NOT include a query string;
+// the gateway signs r.URL.Path alone.
+void addAuthHeaders(HTTPClient& http, const char* method, const char* path, const std::string& body) {
   const int64_t ts = nowEpochMs() ? nowEpochMs() : (int64_t)time(nullptr) * 1000;
   const std::string nonce = randomNonce();
   const std::string digest = sha256Hex(reinterpret_cast<const uint8_t*>(body.data()), body.size());
-  const std::string sig = hmacHex(presence::canonicalString("POST", path, ts, nonce, digest));
+  const std::string sig = hmacHex(presence::canonicalString(method, path, ts, nonce, digest));
 
-  http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Id", g_nvs.getString("device_id", ""));
   http.addHeader("X-Key-Version", String(g_nvs.getInt("key_version", 1)));
   http.addHeader("X-Timestamp", String((long long)ts));
   http.addHeader("X-Nonce", nonce.c_str());
   http.addHeader("X-Signature", sig.c_str());
+}
+
+// signedPost returns the HTTP status, or a negative value on transport error.
+int signedPost(const char* path, const std::string& body, String* response) {
+  HTTPClient http;
+  http.begin(String(kApiBase) + path);
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/json");
+  addAuthHeaders(http, "POST", path, body);
 
   const int code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+  if (response) *response = http.getString();
+  http.end();
+  return code;
+}
+
+// signedGet: the query string goes on the URL but not into the signature.
+int signedGet(const char* path, const String& query, String* response) {
+  HTTPClient http;
+  http.begin(String(kApiBase) + path + (query.length() ? "?" + query : String()));
+  http.setTimeout(15000);
+  addAuthHeaders(http, "GET", path, std::string());
+
+  const int code = http.GET();
   if (response) *response = http.getString();
   http.end();
   return code;
@@ -350,6 +392,10 @@ bool sendHeartbeat() {
   if (presence::parseJsonInt(resp.c_str(), "backoff_s", &v) && v > 0) {
     g_backoffMs = static_cast<uint32_t>(v) * 1000;
   }
+  bool firmware = false;
+  if (presence::parseJsonBool(resp.c_str(), "firmware_available", &firmware)) {
+    g_firmwareAvailable = firmware;
+  }
   if (presence::parseJsonInt(resp.c_str(), "commands_pending", &v) && v > 0) {
     // Command handling is not built yet. Recording the count keeps the
     // heartbeat honest rather than pretending nothing is queued.
@@ -400,6 +446,232 @@ bool flushEvents() {
   return true;
 }
 
+// --------------------------------------------------------------------
+// OTA. SPEC §3: the OTA channel is a security boundary, so an image is
+// bootable only after its Ed25519 signature verifies against the key
+// compiled into THIS firmware (ota_pubkey.h). The verification logic lives
+// in ota_verify.h under host test; this is the flash plumbing around it.
+//
+// Two ordering rules, in the spirit of "persist before confirm":
+//
+// - VERIFY WHAT WILL BOOT, NOT WHAT CAME OVER THE WIRE. The image is written
+//   to the idle slot first and then read back from flash for sha256 and
+//   Ed25519, so a bit that flips between download and flash cannot slip
+//   past a check that ran on the RAM copy.
+// - esp_ota_set_boot_partition() IS THE COMMIT, AND IT COMES LAST. Until it
+//   runs, otadata still points at the running image. Every failure path
+//   returns before it, and erases the head of the rejected slot so nothing
+//   (rollback included) can ever select it.
+// --------------------------------------------------------------------
+enum class OtaOutcome { Applied, Transient, Rejected };
+
+struct OtaResult {
+  OtaOutcome outcome;
+  const char* reason;  // nullptr when applied
+};
+
+constexpr size_t kOtaChunk = 4096;
+constexpr uint32_t kOtaReadTimeoutMs = 30'000;
+
+void invalidateSlot(const esp_partition_t* slot) {
+  esp_partition_erase_range(slot, 0, SPI_FLASH_SEC_SIZE);
+}
+
+// applyOta streams `size` bytes from `in` into the idle OTA slot, verifies
+// them from flash, and on success makes that slot the boot partition. It
+// never reboots; the caller does. ready (optional) is called whenever applyOta
+// is ready for the next chunk -- once after the slot is erased, then after
+// each chunk is written. The bench serial loader uses it for flow control:
+// flash erases and writes stall interrupts that are not in IRAM, the UART's
+// among them, so bytes sent during one would overflow the 128-byte FIFO.
+OtaResult applyOta(Stream& in, size_t size, const uint8_t sha256[presence::kSha256Bytes],
+                   const uint8_t signature[presence::kEd25519SignatureBytes], void (*ready)()) {
+  // Refuse before erasing anything: with no key, nothing can ever verify.
+  if (presence::isUnprovisionedKey(presence::kOtaReleasePublicKey)) {
+    return {OtaOutcome::Rejected, "no release key compiled in"};
+  }
+  if (size == 0) return {OtaOutcome::Rejected, "empty image"};
+
+  const esp_partition_t* slot = esp_ota_get_next_update_partition(nullptr);
+  if (slot == nullptr) return {OtaOutcome::Rejected, "no idle OTA slot"};
+  if (size > slot->size) return {OtaOutcome::Rejected, "image larger than the OTA slot"};
+
+  std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[kOtaChunk]);
+  if (!buf) return {OtaOutcome::Transient, "out of memory"};
+
+  esp_ota_handle_t handle = 0;
+  // Erases the whole of `size` up front, so no erase happens mid-download.
+  if (esp_ota_begin(slot, size, &handle) != ESP_OK) return {OtaOutcome::Transient, "esp_ota_begin failed"};
+  if (ready) ready();
+
+  in.setTimeout(kOtaReadTimeoutMs);
+  for (size_t done = 0; done < size;) {
+    const size_t want = (size - done) < kOtaChunk ? (size - done) : kOtaChunk;
+    if (in.readBytes(buf.get(), want) != want) {
+      esp_ota_abort(handle);
+      invalidateSlot(slot);
+      return {OtaOutcome::Transient, "download truncated"};
+    }
+    if (esp_ota_write(handle, buf.get(), want) != ESP_OK) {
+      esp_ota_abort(handle);
+      invalidateSlot(slot);
+      return {OtaOutcome::Transient, "flash write failed"};
+    }
+    done += want;
+    if (ready && done < size) ready();
+  }
+
+  // esp_ota_end checks the app image format and its checksums. That catches
+  // a corrupt download; it is NOT the security check -- anyone can build a
+  // well-formed image. The handle is freed whatever it returns.
+  if (esp_ota_end(handle) != ESP_OK) {
+    invalidateSlot(slot);
+    return {OtaOutcome::Rejected, "not a valid app image"};
+  }
+
+  presence::ImageVerifier verifier(presence::kOtaReleasePublicKey, signature, size);
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+  for (size_t off = 0; off < size; off += kOtaChunk) {
+    const size_t n = (size - off) < kOtaChunk ? (size - off) : kOtaChunk;
+    if (esp_partition_read(slot, off, buf.get(), n) != ESP_OK) {
+      mbedtls_sha256_free(&sha);
+      invalidateSlot(slot);
+      return {OtaOutcome::Transient, "flash read-back failed"};
+    }
+    mbedtls_sha256_update_ret(&sha, buf.get(), n);
+    verifier.update(buf.get(), n);
+  }
+  uint8_t digest[presence::kSha256Bytes];
+  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  const presence::OtaVerdict verdict = verifier.finish();
+
+  if (memcmp(digest, sha256, sizeof(digest)) != 0) {
+    invalidateSlot(slot);
+    return {OtaOutcome::Rejected, "sha256 does not match manifest"};
+  }
+  if (verdict != presence::OtaVerdict::Ok) {
+    invalidateSlot(slot);
+    return {OtaOutcome::Rejected, presence::otaVerdictName(verdict)};
+  }
+
+  // The commit. Only a verified image gets here.
+  if (esp_ota_set_boot_partition(slot) != ESP_OK) {
+    invalidateSlot(slot);
+    return {OtaOutcome::Transient, "esp_ota_set_boot_partition failed"};
+  }
+  return {OtaOutcome::Applied, nullptr};
+}
+
+void rebootIntoNewImage() {
+  Serial.println("OTA: image verified, boot partition set, rebooting");
+  Serial.flush();
+  // The punch buffer is in flash and the sequence counter is committed
+  // before use, so a reboot here loses nothing that was confirmed.
+  vTaskDelay(pdMS_TO_TICKS(200));
+  esp_restart();
+}
+
+// checkFirmware fetches the manifest and, if it offers an image this
+// terminal has not already rejected, downloads and applies it. Scanning
+// continues on core 1 throughout; only the final reboot interrupts it.
+bool checkFirmware() {
+  String resp;
+  const int code = signedGet("/v1/device/firmware", String("current=") + kFirmwareVersion, &resp);
+  if (code == 401) {
+    handleClockSkew(resp);
+    return false;
+  }
+  if (code != 200) return false;
+
+  presence::OtaManifest m;
+  if (!presence::parseOtaManifest(resp.c_str(), &m)) {
+    log_e("OTA: malformed manifest ignored");
+    return false;
+  }
+  if (!m.available || m.version == kFirmwareVersion) {
+    g_firmwareAvailable = false;
+    return true;
+  }
+  if (g_otaRejected && memcmp(m.sha256, g_otaRejectedSha, sizeof(g_otaRejectedSha)) == 0) {
+    return true;  // already refused this exact image; wait for a new one
+  }
+
+  // The image URL is fetched unauthenticated and possibly over plain HTTP:
+  // its integrity comes from the signature, not the transport.
+  HTTPClient http;
+  http.begin(m.url.c_str());
+  http.setTimeout(15000);
+  const int got = http.GET();
+  if (got != 200) {
+    http.end();
+    return false;
+  }
+  const int contentLength = http.getSize();
+  if (contentLength >= 0 && static_cast<uint64_t>(contentLength) != m.size) {
+    http.end();
+    log_e("OTA: Content-Length %d does not match manifest size", contentLength);
+    return false;
+  }
+  const OtaResult r = applyOta(*http.getStreamPtr(), static_cast<size_t>(m.size), m.sha256, m.signature, nullptr);
+  http.end();
+
+  if (r.outcome == OtaOutcome::Applied) rebootIntoNewImage();
+  log_e("OTA: %s %s: %s", r.outcome == OtaOutcome::Rejected ? "rejected" : "failed", m.version.c_str(),
+        r.reason);
+  if (r.outcome == OtaOutcome::Rejected) {
+    memcpy(g_otaRejectedSha, m.sha256, sizeof(g_otaRejectedSha));
+    g_otaRejected = true;
+  }
+  return false;
+}
+
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+// Bench-only: the same applyOta, fed from the USB serial port, so the
+// signature gate can be proven on a board before the gateway serves
+// manifests. Built into esp32dev-debug only. It is no weaker than the
+// network path -- the image still has to verify against the compiled-in
+// key -- and anyone at the USB port can already reflash with esptool.
+//
+// Protocol (firmware/tools/serial_ota.py speaks it):
+//   host:   OTA <size> <sha256-hex> <signature-hex>\n
+//   device: OTA NEXT            (send the next 4096 bytes; repeats per chunk)
+//   device: OTA OK              then reboots into the new image
+//   device: OTA REJECT <reason> and keeps running the current image
+void benchAck() { Serial.println("OTA NEXT"); }
+
+void benchSerialOta() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (!line.startsWith("OTA ")) return;
+
+  const int a = line.indexOf(' ', 4);
+  const int b = a < 0 ? -1 : line.indexOf(' ', a + 1);
+  if (a < 0 || b < 0) {
+    Serial.println("OTA REJECT malformed header");
+    return;
+  }
+  const long size = line.substring(4, a).toInt();
+  uint8_t sha[presence::kSha256Bytes];
+  uint8_t sig[presence::kEd25519SignatureBytes];
+  if (size <= 0 || !presence::decodeHexExact(line.substring(a + 1, b).c_str(), sha, sizeof(sha)) ||
+      !presence::decodeHexExact(line.substring(b + 1).c_str(), sig, sizeof(sig))) {
+    Serial.println("OTA REJECT malformed header");
+    return;
+  }
+
+  const OtaResult r = applyOta(Serial, static_cast<size_t>(size), sha, sig, benchAck);
+  if (r.outcome == OtaOutcome::Applied) {
+    Serial.println("OTA OK");
+    rebootIntoNewImage();
+  }
+  Serial.printf("OTA REJECT %s\n", r.reason);
+}
+#endif
+
 void netTask(void*) {
   uint32_t lastHeartbeat = 0, lastFlush = 0;
   for (;;) {
@@ -413,15 +685,21 @@ void netTask(void*) {
 
     const uint32_t now = millis();
     bool ok = true;
+    bool otaDue = false;
 
     if (now - lastHeartbeat > kHeartbeatMs) {
       ok = sendHeartbeat() && ok;  // returns version counters; fetch deltas only when they move
       lastHeartbeat = now;
+      otaDue = g_firmwareAvailable;
     }
     if (now - lastFlush > kFlushMs || g_buffer->depth() >= kMaxBatch) {
       ok = flushEvents() && ok;
       lastFlush = now;
     }
+    // At most once per heartbeat, and after the flush so a reboot into a new
+    // image leaves as little as possible buffered. A failed OTA check does
+    // not feed the backoff: it must never delay punch uploads.
+    if (otaDue) checkFirmware();  // reboots on success
 
     ok ? resetBackoff() : growBackoff();
     vTaskDelay(pdMS_TO_TICKS(ok ? 1000 : g_backoffMs));
@@ -431,10 +709,19 @@ void netTask(void*) {
 }  // namespace
 
 void setup() {
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+  // Room for a whole 4 KB chunk, so the loader never overruns the UART.
+  Serial.setRxBufferSize(kOtaChunk + 256);
+#endif
   Serial.begin(115200);
   pinMode(kBuzzerPin, OUTPUT);
   pinMode(kLedGreenPin, OUTPUT);
   pinMode(kLedRedPin, OUTPUT);
+
+  // Which build, from which slot: after an OTA the label flips between app0
+  // and app1, and after a rejected one it must not have.
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  Serial.printf("presence terminal %s, running from %s\n", kFirmwareVersion, running ? running->label : "?");
 
   g_state = State::SelfTest;
   LittleFS.begin(true);
@@ -472,6 +759,12 @@ void setup() {
                   static_cast<unsigned>(g_buffer->depth()));
   }
 
+  // Loud on purpose: a terminal that leaves the desk like this can only ever
+  // be updated by someone physically plugging into it.
+  if (presence::isUnprovisionedKey(presence::kOtaReleasePublicKey)) {
+    Serial.println("WARNING: no OTA release key compiled in; over-the-air updates are disabled");
+  }
+
   if (!g_nvs.isKey("device_secret")) {
     g_state = State::Provision;
   } else {
@@ -484,4 +777,11 @@ void setup() {
   xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
 }
 
-void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
+void loop() {
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+  benchSerialOta();
+  vTaskDelay(pdMS_TO_TICKS(50));
+#else
+  vTaskDelay(pdMS_TO_TICKS(1000));
+#endif
+}
