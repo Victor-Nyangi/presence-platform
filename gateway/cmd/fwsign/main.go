@@ -3,8 +3,7 @@
 //	fwsign keygen -out /offline/presence-ota-release.pem
 //	fwsign pubkey -key /offline/presence-ota-release.pem
 //	fwsign sign   -key /offline/presence-ota-release.pem -image firmware.bin \
-//	              -version 0.2.0 -url https://fw.example.com/0.2.0.bin \
-//	              -header ../firmware/src/ota_pubkey.h > manifest.json
+//	              -version 0.2.0 -header ../firmware/src/ota_pubkey.h > manifest.json
 //	fwsign verify -image firmware.bin -manifest manifest.json \
 //	              -header ../firmware/src/ota_pubkey.h
 //
@@ -16,6 +15,11 @@
 // Pass -header to sign so it fails if the key does not match the public key
 // the firmware compiles in. Without that check it is possible to publish an
 // image that every terminal will (correctly) refuse.
+//
+// -version is signed, and terminals refuse anything not newer than what they
+// run, so sign and verify both require it to equal the version the image was
+// built as (its PRESENCE_FW_VERSION marker). Leave -url out for an image the
+// gateway hosts from PRESENCE_FIRMWARE_DIR; the gateway supplies the path.
 package main
 
 import (
@@ -115,8 +119,8 @@ func sign(args []string) error {
 	fs := flag.NewFlagSet("sign", flag.ExitOnError)
 	key := fs.String("key", "", "private key file")
 	image := fs.String("image", "", "firmware image (.pio/build/<env>/firmware.bin)")
-	version := fs.String("version", "", "firmware version the image reports (FIRMWARE_VERSION)")
-	url := fs.String("url", "", "where the gateway will tell terminals to download the image")
+	version := fs.String("version", "", "MAJOR.MINOR.PATCH; must equal the FIRMWARE_VERSION the image was built with")
+	url := fs.String("url", "", "absolute URL of an externally hosted image; omit when the gateway hosts it")
 	header := fs.String("header", "", "firmware/src/ota_pubkey.h; fail unless the key matches it")
 	fs.Parse(args)
 
@@ -135,6 +139,9 @@ func sign(args []string) error {
 	}
 	img, err := os.ReadFile(*image)
 	if err != nil {
+		return err
+	}
+	if err := checkImageVersion(img, *version); err != nil {
 		return err
 	}
 	m, err := fwsign.Sign(priv, img, *version, *url)
@@ -182,9 +189,27 @@ func verify(args []string) error {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return err
 	}
+	if err := checkImageVersion(img, m.Version); err != nil {
+		return err
+	}
 	if err := fwsign.Verify(pub, img, m); err != nil {
 		return err
 	}
-	fmt.Println("ok: image verifies against", hex.EncodeToString(pub))
+	fmt.Printf("ok: version %s verifies against %s\n", m.Version, hex.EncodeToString(pub))
+	return nil
+}
+
+// checkImageVersion refuses to sign (or bless) an image under a version it was
+// not built as. Terminals trust the signed version for downgrade protection,
+// so a 0.2.0 build signed as 0.3.0 would install, report 0.2.0, and be offered
+// 0.3.0 again on every heartbeat.
+func checkImageVersion(img []byte, version string) error {
+	built, err := fwsign.ImageVersion(img)
+	if err != nil {
+		return err
+	}
+	if built != version {
+		return fmt.Errorf("the image was built as %s, not %s; set FIRMWARE_VERSION in platformio.ini and rebuild", built, version)
+	}
 	return nil
 }

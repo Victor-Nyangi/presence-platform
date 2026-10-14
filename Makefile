@@ -29,7 +29,7 @@ firmware-test: ## Compile and run firmware logic tests on the host
 	@mkdir -p .build
 	gcc -std=c99 -Wall -Wextra -O1 -c -o .build/monocypher.o $(MONOCYPHER)/monocypher.c
 	gcc -std=c99 -Wall -Wextra -O1 -c -o .build/monocypher-ed25519.o $(MONOCYPHER)/monocypher-ed25519.c
-	g++ -std=c++17 -Wall -Wextra -O1 -I$(MONOCYPHER) -o .build/fwtest \
+	g++ -std=c++17 -Wall -Wextra -Werror -O1 -I$(MONOCYPHER) -o .build/fwtest \
 		firmware/test/host_test.cpp firmware/src/crc32.cpp \
 		.build/monocypher.o .build/monocypher-ed25519.o
 	@./.build/fwtest

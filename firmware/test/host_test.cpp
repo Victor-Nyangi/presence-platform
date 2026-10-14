@@ -5,17 +5,22 @@
 //
 // What is NOT covered here: anything touching the sensor, Wi-Fi, or real
 // flash. Those need hardware. The OTA gate (ota_verify.h) IS covered: the
-// same Monocypher sources the terminal links are compiled in here.
+// same Monocypher sources the terminal links are compiled in here. So is the
+// OTA downgrade and rollback state machine (ota_guard.h), against a
+// simulated two-slot flash, bootloader and file-backed NVS.
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "../src/canonical.h"
 #include "../src/events_json.h"
+#include "../src/ota_guard.h"
 #include "../src/ota_pubkey.h"
 #include "../src/ota_verify.h"
 #include "../src/ring_buffer.h"
@@ -811,26 +816,48 @@ static std::vector<uint8_t> makeImage(size_t n) {
   return img;
 }
 
-static std::vector<uint8_t> signImage(const TestKey& k, const std::vector<uint8_t>& img) {
+// What fwsign signs: the preamble for (version, size), then the image.
+static std::vector<uint8_t> signedMessage(const std::string& version, const std::vector<uint8_t>& img) {
+  const std::string pre = otaSignedPreamble(version, img.size());
+  std::vector<uint8_t> msg(pre.begin(), pre.end());
+  msg.insert(msg.end(), img.begin(), img.end());
+  return msg;
+}
+
+static const char* kTestVersion = "0.2.0";
+
+static std::vector<uint8_t> signImage(const TestKey& k, const std::vector<uint8_t>& img,
+                                      const std::string& version = kTestVersion) {
+  const std::vector<uint8_t> msg = signedMessage(version, img);
   std::vector<uint8_t> sig(64);
-  crypto_ed25519_sign(sig.data(), k.sk, img.data(), img.size());
+  crypto_ed25519_sign(sig.data(), k.sk, msg.data(), msg.size());
   return sig;
 }
 
 // Streams img through an ImageVerifier in `chunk`-sized pieces, as main.cpp
 // does when it reads the OTA partition back.
 static OtaVerdict verifyStreamed(const uint8_t* pk, const uint8_t* sig, size_t expected,
-                                 const uint8_t* img, size_t len, size_t chunk) {
-  ImageVerifier v(pk, sig, expected);
+                                 const uint8_t* img, size_t len, size_t chunk,
+                                 const std::string& version = kTestVersion) {
+  ImageVerifier v(pk, sig, version, expected);
   for (size_t off = 0; off < len; off += chunk) {
     v.update(img + off, len - off < chunk ? len - off : chunk);
   }
   return v.finish();
 }
 
+// The raw primitive, streamed: what the RFC vectors run through.
+static bool streamRaw(const uint8_t* pk, const uint8_t* sig, const uint8_t* msg, size_t len, size_t chunk) {
+  Ed25519Stream v(pk, sig);
+  for (size_t off = 0; off < len; off += chunk) {
+    v.update(msg + off, len - off < chunk ? len - off : chunk);
+  }
+  return v.finish();
+}
+
 static OtaVerdict verifyImage(const TestKey& k, const std::vector<uint8_t>& sig,
-                              const std::vector<uint8_t>& img) {
-  return verifyStreamed(k.pk, sig.data(), img.size(), img.data(), img.size(), 4096);
+                              const std::vector<uint8_t>& img, const std::string& version = kTestVersion) {
+  return verifyStreamed(k.pk, sig.data(), img.size(), img.data(), img.size(), 4096, version);
 }
 
 static void testRfc8032Vectors() {
@@ -856,10 +883,9 @@ static void testRfc8032Vectors() {
       // the chunking -- byte at a time, an odd size, and one big chunk.
       bool allChunkings = true;
       for (size_t chunk : {static_cast<size_t>(1), static_cast<size_t>(7), static_cast<size_t>(4096)}) {
-        allChunkings = allChunkings &&
-                       verifyStreamed(v.pk, v.sig, v.msgLen, v.msg, v.msgLen, chunk) == OtaVerdict::Ok;
+        allChunkings = allChunkings && streamRaw(v.pk, v.sig, v.msg, v.msgLen, chunk);
       }
-      check(allChunkings, (name + " streams through ImageVerifier at chunk 1/7/4096").c_str());
+      check(allChunkings, (name + " streams through Ed25519Stream at chunk 1/7/4096").c_str());
     }
   }
 }
@@ -873,8 +899,9 @@ static void testValidImageSignatureAccepted() {
   check(verifyImage(k, sig, img) == OtaVerdict::Ok, "image signed with a test-time key verifies");
   check(verifyStreamed(k.pk, sig.data(), img.size(), img.data(), img.size(), 1000) == OtaVerdict::Ok,
         "and verifies at a different chunk size");
-  check(ed25519Verify(sig.data(), k.pk, img.data(), img.size()),
-        "streaming agrees with one-shot verification");
+  const std::vector<uint8_t> msg = signedMessage(kTestVersion, img);
+  check(ed25519Verify(sig.data(), k.pk, msg.data(), msg.size()),
+        "streaming agrees with one-shot verification over preamble + image");
 
   const std::vector<uint8_t> one = makeImage(1);
   check(verifyImage(k, signImage(k, one), one) == OtaVerdict::Ok, "a 1-byte image verifies");
@@ -974,6 +1001,11 @@ static void testEmptyImageRejected() {
         "TEST 1 is a valid signature over an empty message");
   check(verifyStreamed(empty.pk, empty.sig, 0, empty.msg, 0, 4096) == OtaVerdict::EmptyImage,
         "the same signature as an OTA image is rejected as empty");
+  // And a key that signs the preamble for size 0 still gets nothing.
+  const TestKey k0 = makeTestKey();
+  const std::vector<uint8_t> none;
+  check(verifyImage(k0, signImage(k0, none), none) == OtaVerdict::EmptyImage,
+        "a validly signed zero-byte image is rejected as empty");
 
   const TestKey k = makeTestKey();
   const std::vector<uint8_t> img = makeImage(4096);
@@ -1007,7 +1039,7 @@ static void testVerifierIsSingleUse() {
   const TestKey k = makeTestKey();
   const std::vector<uint8_t> img = makeImage(1024);
   const std::vector<uint8_t> sig = signImage(k, img);
-  ImageVerifier v(k.pk, sig.data(), img.size());
+  ImageVerifier v(k.pk, sig.data(), kTestVersion, img.size());
   v.update(img.data(), img.size());
   check(v.finish() == OtaVerdict::Ok, "first finish() is ok");
   check(v.finish() == OtaVerdict::BadSignature, "a second finish() is not");
@@ -1017,17 +1049,19 @@ static void testVerifierIsSingleUse() {
 // HMAC golden vector pins the gateway to the device. The same values are in
 // gateway/internal/fwsign/fwsign_test.go. They were produced once with a key
 // generated in memory and never written anywhere; only the public half
-// exists. If the tool ever signs something other than the raw image bytes
-// (a hash, hex, a prehash variant), one side of this fails.
+// exists. The message is otaSignedPreamble("1.2.3", 4099) followed by the
+// image. If the tool ever signs something else (the bare image, a hash, a
+// prehash variant, a different preamble), one side of this fails.
 static std::vector<uint8_t> goldenImage() {
   std::vector<uint8_t> img(4099);
   for (size_t i = 0; i < img.size(); i++) img[i] = static_cast<uint8_t>((i * 167 + 13) ^ (i >> 8));
   return img;
 }
-static const char* kGoldenPublicKey = "3cd093728d823e9acc0bff6a7d13fa56ebb1ec74919534be98cb7a0621dd1858";
+static const char* kGoldenVersion = "1.2.3";
+static const char* kGoldenPublicKey = "084dbbdd1f539f42a53792f892b2b6fd3d876c5ff6689420bb7d402ae51a28d9";
 static const char* kGoldenSignature =
-    "5c4bcc9ae75f0e50435e512ff754ba38ba074890774fff7eabe74be5963b3415"
-    "f7627f50e35ee73fb7b80137a92228bbaf3b864592b325064ba881bd8c247d08";
+    "0a44e507c61010f4416b476813bb337b4cbcdd9f7845067a8c90a1401bf3bb1a"
+    "11bfa94df02146f193932a021f506229479b024911a4930b590e9acebfcd2f0e";
 
 static void testSigningToolGoldenVector() {
   printf("\nOTA: signing tool golden vector\n");
@@ -1035,12 +1069,15 @@ static void testSigningToolGoldenVector() {
   check(decodeHexExact(kGoldenPublicKey, pk, 32) && decodeHexExact(kGoldenSignature, sig, 64),
         "golden key and signature decode");
   const std::vector<uint8_t> img = goldenImage();
-  check(verifyStreamed(pk, sig, img.size(), img.data(), img.size(), 4096) == OtaVerdict::Ok,
+  check(verifyStreamed(pk, sig, img.size(), img.data(), img.size(), 4096, kGoldenVersion) == OtaVerdict::Ok,
         "an image signed by Go crypto/ed25519 verifies on the firmware path");
   std::vector<uint8_t> bad = img;
   bad[4098] ^= 0x01;
-  check(verifyStreamed(pk, sig, bad.size(), bad.data(), bad.size(), 4096) == OtaVerdict::BadSignature,
+  check(verifyStreamed(pk, sig, bad.size(), bad.data(), bad.size(), 4096, kGoldenVersion) ==
+            OtaVerdict::BadSignature,
         "and the same image with its last byte flipped does not");
+  check(verifyStreamed(pk, sig, img.size(), img.data(), img.size(), 4096, "1.2.4") == OtaVerdict::BadSignature,
+        "and the same image under another version does not");
 }
 
 static void testManifestParsing() {
@@ -1055,7 +1092,7 @@ static void testManifestParsing() {
   OtaManifest m;
   check(parseOtaManifest(manifest(sha, sig, "4099").c_str(), &m) && m.available && m.size == 4099 &&
             m.version == "0.2.0" && m.url == "https://fw.example.com/p.bin?a=1&b=2" && m.sha256[0] == 0xaa &&
-            m.signature[0] == 0x5c && m.signature[63] == 0x08,
+            m.signature[0] == 0x0a && m.signature[63] == 0x0e,
         "a complete manifest parses");
 
   OtaManifest none;
@@ -1091,6 +1128,473 @@ static void testManifestParsing() {
   check(parseJsonBool("{\"firmware_available\": false}", "firmware_available", &b) && !b,
         "firmware_available:false parses");
   check(!parseJsonBool("{\"firmware_available\": 1}", "firmware_available", &b), "a non-boolean is refused");
+}
+
+// ---------------------------------------------------------------------
+// OTA versions and downgrade protection
+// ---------------------------------------------------------------------
+
+// The same table as gateway/internal/fwversion/fwversion_test.go. If the two
+// grammars drift, the gateway can offer an image the terminal cannot
+// compare, or call a build newer that the terminal calls older.
+static void testVersionGrammar() {
+  printf("\nOTA: version grammar (shared with the gateway)\n");
+  struct Case {
+    const char* in;
+    size_t len;  // explicit, so an embedded NUL can be tested
+    bool ok;
+    uint64_t code;
+  };
+  const Case cases[] = {
+      {"0.0.0", 5, true, 0},
+      {"0.1.0", 5, true, 1ull << 16},
+      {"1.2.3", 5, true, (1ull << 32) | (2ull << 16) | 3},
+      {"65535.65535.65535", 17, true, (65535ull << 32) | (65535ull << 16) | 65535},
+      {"10.0.1", 6, true, (10ull << 32) | 1},
+      {"", 0, false, 0},
+      {"1", 1, false, 0},
+      {"1.2", 3, false, 0},
+      {"1.2.3.4", 7, false, 0},
+      {"01.2.3", 6, false, 0},
+      {"1.02.3", 6, false, 0},
+      {"1.2.03", 6, false, 0},
+      {"65536.0.0", 9, false, 0},
+      {"1.2.3-dev", 9, false, 0},
+      {"0.0.0-dev", 9, false, 0},
+      {"v1.2.3", 6, false, 0},
+      {"+1.2.3", 6, false, 0},
+      {"-1.2.3", 6, false, 0},
+      {"1..3", 4, false, 0},
+      {"1.2.", 4, false, 0},
+      {".1.2", 4, false, 0},
+      {" 1.2.3", 6, false, 0},
+      {"1.2.3 ", 6, false, 0},
+      {"123456.0.0", 10, false, 0},
+      {"1.2.3\0", 6, false, 0},
+  };
+  bool all = true;
+  for (const Case& c : cases) {
+    uint64_t code = 0;
+    const bool ok = parseOtaVersion(std::string(c.in, c.len), &code);
+    if (ok != c.ok || (ok && code != c.code) || (ok && formatOtaVersion(code) != std::string(c.in, c.len))) {
+      printf("        mismatch on \"%s\"\n", c.in);
+      all = false;
+    }
+  }
+  check(all, "all 25 grammar cases agree with the gateway's table");
+
+  static_assert(otaVersionCodeLiteral("0.1.0") == (1ull << 16), "constexpr parse");
+  static_assert(otaVersionCodeLiteral("0.0.0-dev") == kInvalidOtaVersion, "a dev suffix does not compile");
+  check(otaVersionCodeLiteral("0.2.0") > otaVersionCodeLiteral("0.1.65535") &&
+            otaVersionCodeLiteral("0.10.0") > otaVersionCodeLiteral("0.9.0") &&
+            otaVersionCodeLiteral("1.0.0") > otaVersionCodeLiteral("0.65535.65535"),
+        "codes order the way versions do, not the way strings do");
+}
+
+static void testPreambleBytes() {
+  printf("\nOTA: signed preamble\n");
+  check(otaSignedPreamble("0.2.0", 770992) == "presence-ota-image/v1\nversion=0.2.0\nsize=770992\n",
+        "preamble is byte-identical to fwsign.Preamble");
+}
+
+// The version is part of the signed message. A validly signed OLD image
+// cannot be presented as a newer one, and a signature over the bare image
+// (the scheme before versions were signed) is worthless.
+static void testVersionIsBoundIntoTheSignature() {
+  printf("\nOTA: the version is signed\n");
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> old = makeImage(20 * 1024);
+  const std::vector<uint8_t> sig = signImage(k, old, "0.1.0");
+  check(verifyImage(k, sig, old, "0.1.0") == OtaVerdict::Ok, "an image verifies under the version it was signed as");
+  check(verifyImage(k, sig, old, "0.9.0") == OtaVerdict::BadSignature,
+        "the same image and signature claimed as a newer version is rejected");
+  check(verifyImage(k, sig, old, "0.0.9") == OtaVerdict::BadSignature,
+        "and claimed as an older version");
+
+  std::vector<uint8_t> bare(64);
+  crypto_ed25519_sign(bare.data(), k.sk, old.data(), old.size());
+  check(verifyImage(k, bare, old, "0.1.0") == OtaVerdict::BadSignature,
+        "a signature over the bare image does not verify");
+  check(verifyImage(k, signImage(k, old, "0.1.0-dev"), old, "0.1.0-dev") == OtaVerdict::BadVersion,
+        "an unparseable version is refused even when it was signed");
+}
+
+static void testManifestUrlForms() {
+  printf("\nOTA: manifest URL forms and versions\n");
+  const std::string sha(64, 'b');
+  const std::string sig(128, 'c');
+  auto manifest = [&](const std::string& version, const std::string& url) {
+    return "{\"available\":true,\"version\":\"" + version + "\",\"url\":\"" + url +
+           "\",\"size\":4099,\"sha256\":\"" + sha + "\",\"signature\":\"" + sig + "\"}";
+  };
+  OtaManifest m;
+  check(parseOtaManifest(manifest("0.2.0", "/v1/device/firmware/images/" + sha).c_str(), &m) &&
+            otaUrlIsGatewayPath(m.url),
+        "a gateway-relative image path parses");
+  check(!parseOtaManifest(manifest("0.2.0", "/v1/device/firmware/images/" + sha + "?x=1").c_str(), &m),
+        "a gateway path with a query is refused (the path is signed verbatim)");
+  check(!parseOtaManifest(manifest("0.2.0", "/v1/device/firmware/images/../../time").c_str(), &m),
+        "a gateway path with .. is refused");
+  check(!parseOtaManifest(manifest("0.2.0", "/etc/passwd").c_str(), &m), "any other relative path is refused");
+  check(!parseOtaManifest(manifest("0.2.0", "").c_str(), &m), "an empty URL is refused");
+  check(!parseOtaManifest(manifest("0.2.0-rc1", "https://x/p.bin").c_str(), &m),
+        "a pre-release version is refused");
+  check(!parseOtaManifest(manifest("0.2", "https://x/p.bin").c_str(), &m), "a two-part version is refused");
+}
+
+// ---- the guard against a simulated terminal --------------------------
+
+// NVS stand-in: the OTA blob in a file, replaced atomically (write a temp
+// file, rename) the way an NVS entry is. A "reboot" builds a new store and a
+// new OtaGuard over the same file, so nothing survives in RAM.
+class FileOtaStore : public OtaStateStore {
+ public:
+  explicit FileOtaStore(std::string path) : path_(std::move(path)) {}
+  bool load(OtaPersistedState* out) override {
+    FILE* f = fopen(path_.c_str(), "rb");
+    if (!f) return false;
+    const size_t n = fread(out, 1, sizeof(*out), f);
+    const bool extra = fgetc(f) != EOF;
+    fclose(f);
+    return n == sizeof(*out) && !extra;
+  }
+  bool save(const OtaPersistedState& s) override {
+    if (failWrites) return false;
+    const std::string tmp = path_ + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = fwrite(&s, 1, sizeof(s), f) == sizeof(s);
+    fclose(f);
+    return ok && rename(tmp.c_str(), path_.c_str()) == 0;
+  }
+  bool failWrites = false;
+
+ private:
+  std::string path_;
+};
+
+// Two app slots, otadata and the IDF 4.4 bootloader's rollback rules
+// (bootloader_utility_get_selected_boot_partition with
+// CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE), reduced to what the guard sees.
+enum class ImgState { None, New, PendingVerify, Valid, Invalid, Aborted };
+
+class SimDevice : public OtaBootControl {
+ public:
+  struct Slot {
+    std::string version;  // what the image in this slot was built as
+    uint8_t sha[kSha256Bytes] = {};
+    bool hasEntry = false;  // otadata names this slot
+    uint32_t seq = 0;
+    ImgState state = ImgState::None;
+  };
+  Slot slot[2];
+  int running = 0;
+  int markValidCalls = 0;
+  int rollbackCalls = 0;
+  bool failMarkValid = false;
+  std::function<void()> onMarkValid;
+
+  // `pio run -t upload`: app0 written, otadata reset. NVS is untouched.
+  void usbFlash(const std::string& version, uint8_t shaByte) {
+    slot[0] = Slot{};
+    slot[0].version = version;
+    memset(slot[0].sha, shaByte, kSha256Bytes);
+    slot[1].hasEntry = false;
+    slot[1].state = ImgState::None;
+    running = 0;
+  }
+  int idle() const { return 1 - running; }
+
+  // esp_ota_end + esp_ota_set_boot_partition on the idle slot.
+  void setBootIdle(const std::string& version, const uint8_t sha[kSha256Bytes]) {
+    Slot& s = slot[idle()];
+    s.version = version;
+    memcpy(s.sha, sha, kSha256Bytes);
+    s.hasEntry = true;
+    s.seq = std::max(slot[0].seq, slot[1].seq) + 1;
+    s.state = ImgState::New;
+  }
+
+  static bool selectable(const Slot& s) {
+    return s.hasEntry && s.state != ImgState::Invalid && s.state != ImgState::Aborted;
+  }
+
+  // Power on.
+  void bootloader() {
+    for (Slot& s : slot) {
+      if (s.hasEntry && s.state == ImgState::PendingVerify) s.state = ImgState::Aborted;
+    }
+    int pick = -1;
+    for (int i = 0; i < 2; i++) {
+      if (selectable(slot[i]) && (pick < 0 || slot[i].seq > slot[pick].seq)) pick = i;
+    }
+    if (pick < 0) pick = 0;  // no factory partition: "trying OTA 0"
+    running = pick;
+    if (slot[pick].hasEntry && slot[pick].state == ImgState::New) slot[pick].state = ImgState::PendingVerify;
+  }
+  bool runningPending() const { return slot[running].hasEntry && slot[running].state == ImgState::PendingVerify; }
+  const std::string& runningVersion() const { return slot[running].version; }
+
+  bool markValid() override {
+    markValidCalls++;
+    if (onMarkValid) onMarkValid();
+    if (failMarkValid) return false;
+    if (slot[running].hasEntry) slot[running].state = ImgState::Valid;
+    return true;
+  }
+  // esp_ota_mark_app_invalid_rollback_and_reboot(), then esp_restart() if
+  // that refused. The API refuses when otadata has no entry for the other
+  // slot (the first update after a USB flash), and the image stays
+  // PENDING_VERIFY, which the bootloader turns into the same fallback.
+  void rollback() override {
+    rollbackCalls++;
+    if (selectable(slot[idle()])) slot[running].state = ImgState::Invalid;
+  }
+};
+
+static const char* kOtaNvsPath = "/tmp/presence_fwtest_ota_state.bin";
+
+struct SimTerminal {
+  SimDevice dev;
+  std::unique_ptr<FileOtaStore> store;
+  std::unique_ptr<OtaGuard> guard;
+  uint32_t confirmMs = 600000;
+
+  SimTerminal() { remove(kOtaNvsPath); }
+  ~SimTerminal() {
+    remove(kOtaNvsPath);
+    remove((std::string(kOtaNvsPath) + ".tmp").c_str());
+  }
+
+  OtaBootKind boot(uint32_t nowMs = 0) {
+    dev.bootloader();
+    store.reset(new FileOtaStore(kOtaNvsPath));
+    guard.reset(new OtaGuard(store.get(), &dev, confirmMs));
+    return guard->begin(dev.runningVersion(), dev.runningPending(), nowMs);
+  }
+
+  // applyOta's order once the image has verified: downgrade check, pending
+  // record, then the commit.
+  OtaCandidate install(const std::string& version, uint8_t shaByte) {
+    uint8_t sha[kSha256Bytes];
+    memset(sha, shaByte, sizeof(sha));
+    const OtaCandidate c = guard->check(version, sha);
+    if (c != OtaCandidate::Accept) return c;
+    if (!guard->notePending(version, sha)) return OtaCandidate::Unconfirmed;
+    dev.setBootIdle(version, sha);
+    return c;
+  }
+  OtaCandidate check(const std::string& version, uint8_t shaByte) const {
+    uint8_t sha[kSha256Bytes];
+    memset(sha, shaByte, sizeof(sha));
+    return guard->check(version, sha);
+  }
+  uint64_t storedFloor() {
+    OtaPersistedState st;
+    FileOtaStore f(kOtaNvsPath);
+    return f.load(&st) ? st.floor : 0;
+  }
+};
+
+static uint64_t V(const char* s) {
+  uint64_t v = 0;
+  parseOtaVersion(s, &v);
+  return v;
+}
+
+// A replayed older signed image, an equal one, a newer one -- through both
+// layers, the signature and the guard.
+static void testDowngradeIsRefused() {
+  printf("\nOTA guard: downgrade protection\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  check(t.boot() == OtaBootKind::Normal, "a USB-flashed image boots as normal, not pending");
+
+  const TestKey k = makeTestKey();
+  const std::vector<uint8_t> oldImg = makeImage(16 * 1024);
+  const std::vector<uint8_t> oldSig = signImage(k, oldImg, "0.1.0");
+  check(verifyImage(k, oldSig, oldImg, "0.1.0") == OtaVerdict::Ok, "the replayed 0.1.0 image is validly signed");
+  check(t.check("0.1.0", 0x10) == OtaCandidate::NotNewer, "and is still refused: older than the running 0.2.0");
+  check(verifyImage(k, oldSig, oldImg, "0.3.0") == OtaVerdict::BadSignature,
+        "relabelling it 0.3.0 to get past the guard breaks the signature");
+  check(t.check("0.2.0", 0x20) == OtaCandidate::NotNewer, "an equal version is refused");
+  check(t.check("0.2.0", 0x21) == OtaCandidate::NotNewer, "an equal version with different bytes is refused");
+  check(t.check("0.2.1", 0x21) == OtaCandidate::Accept, "a newer version is accepted");
+  check(t.check("1.0.0", 0x30) == OtaCandidate::Accept, "a newer major version is accepted");
+  check(t.check("0.2.1-rc1", 0x21) == OtaCandidate::BadVersion, "a candidate version that does not parse is refused");
+
+  SimTerminal dev;
+  dev.dev.usbFlash("0.0.0-dev", 0x01);  // what the old default would have been
+  dev.boot();
+  check(dev.check("9.9.9", 0x99) == OtaCandidate::RunningUnversioned,
+        "a build without a comparable version refuses every update");
+}
+
+static void testConfirmedUpdateRaisesTheFloor() {
+  printf("\nOTA guard: a healthy update is confirmed\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  check(t.install("0.3.0", 0x30) == OtaCandidate::Accept, "0.3.0 installs");
+  check(t.boot(1000) == OtaBootKind::AwaitingConfirm && t.dev.runningVersion() == "0.3.0",
+        "it boots pending verification");
+  check(t.check("0.4.0", 0x40) == OtaCandidate::Unconfirmed,
+        "no further update is taken while this one is unconfirmed");
+
+  uint64_t floorWhenMarked = 1;
+  t.dev.onMarkValid = [&] { floorWhenMarked = t.storedFloor(); };
+  t.guard->tick(1000 + t.confirmMs - 1);
+  check(t.dev.rollbackCalls == 0, "no rollback inside the window");
+  t.guard->onHealthy();
+  check(t.dev.markValidCalls == 1 && !t.guard->awaitingConfirm() && t.dev.slot[t.dev.running].state == ImgState::Valid,
+        "the first heartbeat marks it valid");
+  check(floorWhenMarked == 0, "it is marked valid BEFORE the floor is raised");
+  check(t.storedFloor() == V("0.3.0") && t.guard->floor() == V("0.3.0"), "the floor is raised to 0.3.0 in NVS");
+  t.guard->onHealthy();
+  check(t.dev.markValidCalls == 1, "later heartbeats do not repeat it");
+  t.guard->tick(1000 + 10 * t.confirmMs);
+  check(t.dev.rollbackCalls == 0, "a confirmed image is never rolled back by the timer");
+  check(t.check("0.4.0", 0x40) == OtaCandidate::Accept, "and updates are taken again");
+}
+
+static void testFloorSurvivesReboot() {
+  printf("\nOTA guard: the floor survives a reboot\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.boot();
+  t.guard->onHealthy();
+
+  check(t.boot() == OtaBootKind::Normal && t.guard->floor() == V("0.3.0"),
+        "after a reboot the floor is read back from NVS");
+  check(t.check("0.3.0", 0x30) == OtaCandidate::NotNewer, "the running version is still refused");
+
+  // The terminal ends up on an older build with its NVS intact: a USB
+  // reflash, or the bootloader falling back past a corrupt slot.
+  t.dev.usbFlash("0.1.0", 0x10);
+  t.boot();
+  check(t.guard->floor() == V("0.3.0"), "an older build on the same NVS keeps the floor");
+  check(t.check("0.2.0", 0x20) == OtaCandidate::BelowFloor, "0.2.0 is newer than the running 0.1.0 but below the floor");
+  check(t.check("0.3.0", 0x30) == OtaCandidate::BelowFloor, "the floor version itself is refused");
+  check(t.check("0.3.1", 0x31) == OtaCandidate::Accept, "above the floor is accepted");
+  t.guard->onHealthy();
+  check(t.storedFloor() == V("0.3.0"), "a healthy older build never lowers the floor");
+}
+
+static void rollbackScenario(bool firstUpdateAfterUsbFlash) {
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  if (!firstUpdateAfterUsbFlash) {
+    // One confirmed update first, so otadata names both slots.
+    t.install("0.2.5", 0x25);
+    t.boot();
+    t.guard->onHealthy();
+    t.boot();
+  }
+  const std::string before = t.dev.runningVersion();
+  const int beforeSlot = t.dev.running;
+  const uint64_t floorBefore = t.guard->floor();
+  const int markedBefore = t.dev.markValidCalls;
+
+  t.install("0.3.0", 0x30);
+  t.boot(5000);
+  check(t.guard->awaitingConfirm(), "the new image boots pending");
+  t.guard->tick(5000 + t.confirmMs - 1);
+  check(t.dev.rollbackCalls == 0, "nothing happens one millisecond before the deadline");
+  t.guard->tick(5000 + t.confirmMs);
+  check(t.dev.rollbackCalls == 1, "no heartbeat inside the window: rollback");
+  check(t.dev.markValidCalls == markedBefore, "it was never marked valid");
+  t.guard->tick(5000 + 2 * t.confirmMs);
+  check(t.dev.rollbackCalls == 1, "rollback is requested once");
+
+  check(t.boot() == OtaBootKind::RolledBack, "the next boot reports the rollback");
+  check(t.dev.runningVersion() == before && t.dev.running == beforeSlot, "and runs the previous image from its slot");
+  check(t.guard->floor() == floorBefore, "the floor did not move");
+  check(t.check("0.3.0", 0x30) == OtaCandidate::KnownBad, "the rolled-back image is never retried");
+  check(t.check("0.3.0", 0x31) == OtaCandidate::Accept, "a different 0.3.0 build may be");
+  check(t.check("0.3.1", 0x31) == OtaCandidate::Accept, "and so may a newer release");
+  t.guard->onHealthy();
+  check(t.storedFloor() == floorBefore || t.storedFloor() == V(before.c_str()),
+        "the old image's heartbeat raises the floor no higher than itself");
+}
+
+static void testUnconfirmedImageRollsBack() {
+  printf("\nOTA guard: no heartbeat in time rolls back (first update after a USB flash)\n");
+  rollbackScenario(true);
+  printf("\nOTA guard: no heartbeat in time rolls back (both slots in otadata)\n");
+  rollbackScenario(false);
+}
+
+static void testPowerCutInTheConfirmWindow() {
+  printf("\nOTA guard: a reboot before confirmation rolls back\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.boot();
+  check(t.guard->awaitingConfirm(), "pending after the update");
+  // Power cut, crash or watchdog: no tick, no rollback() call.
+  check(t.boot() == OtaBootKind::RolledBack && t.dev.runningVersion() == "0.2.0",
+        "the bootloader aborts the unconfirmed image and boots the old one");
+  check(t.check("0.3.0", 0x30) == OtaCandidate::KnownBad, "and the guard learns it from NVS alone");
+}
+
+static void testMarkValidFailureIsRetried() {
+  printf("\nOTA guard: a failed mark-valid is retried\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.boot();
+  t.dev.failMarkValid = true;
+  t.guard->onHealthy();
+  check(t.guard->awaitingConfirm() && t.storedFloor() == 0, "still pending, floor untouched");
+  t.dev.failMarkValid = false;
+  t.guard->onHealthy();
+  check(!t.guard->awaitingConfirm() && t.storedFloor() == V("0.3.0"), "the next heartbeat confirms it");
+}
+
+static void testPendingRecordFailureBlocksTheCommit() {
+  printf("\nOTA guard: no pending record, no commit\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.store->failWrites = true;
+  uint8_t sha[kSha256Bytes];
+  memset(sha, 0x30, sizeof(sha));
+  check(t.guard->check("0.3.0", sha) == OtaCandidate::Accept && !t.guard->notePending("0.3.0", sha),
+        "notePending reports an NVS failure, so applyOta never sets the boot partition");
+}
+
+static void testCorruptOtaStateStartsClean() {
+  printf("\nOTA guard: unreadable NVS state\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  FILE* f = fopen(kOtaNvsPath, "wb");
+  fputs("garbage", f);
+  fclose(f);
+  check(t.boot() == OtaBootKind::Normal && t.guard->floor() == 0, "a short blob is ignored");
+  OtaPersistedState st;
+  memset(&st, 0xAB, sizeof(st));
+  FileOtaStore(kOtaNvsPath).save(st);
+  check(t.boot() == OtaBootKind::Normal && t.guard->floor() == 0, "a blob with the wrong magic is ignored");
+  check(t.check("0.2.1", 0x21) == OtaCandidate::Accept, "and updates still work");
+}
+
+static void testConfirmWindowAcrossMillisWrap() {
+  printf("\nOTA guard: the confirm window across a millis() wrap\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  const uint32_t start = 0xFFFFFFFFu - 1000;
+  t.boot(start);
+  t.guard->tick(start + 2000);  // wrapped, 2 s elapsed
+  check(t.dev.rollbackCalls == 0, "a wrap does not look like an expired window");
+  t.guard->tick(start + t.confirmMs);
+  check(t.dev.rollbackCalls == 1, "the window still expires on time");
 }
 
 int main() {
@@ -1132,6 +1636,19 @@ int main() {
   testVerifierIsSingleUse();
   testSigningToolGoldenVector();
   testManifestParsing();
+  testVersionGrammar();
+  testPreambleBytes();
+  testVersionIsBoundIntoTheSignature();
+  testManifestUrlForms();
+  testDowngradeIsRefused();
+  testConfirmedUpdateRaisesTheFloor();
+  testFloorSurvivesReboot();
+  testUnconfirmedImageRollsBack();
+  testPowerCutInTheConfirmWindow();
+  testMarkValidFailureIsRetried();
+  testPendingRecordFailureBlocksTheCommit();
+  testCorruptOtaStateStartsClean();
+  testConfirmWindowAcrossMillisWrap();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;
