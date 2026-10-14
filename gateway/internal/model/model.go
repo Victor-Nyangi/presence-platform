@@ -226,10 +226,12 @@ type Problem struct {
 }
 
 // FirmwareManifest is the 200 body of GET /v1/device/firmware. Signature is
-// a hex-encoded, detached, pure Ed25519 (RFC 8032) signature over the exact
-// bytes served at URL; the terminal verifies it against the public key
-// compiled into its firmware before it will boot the image. cmd/fwsign
-// produces these; firmware/src/ota_verify.h parses them.
+// a hex-encoded, detached, pure Ed25519 (RFC 8032) signature over
+// fwsign.Preamble(Version, Size) followed by the exact bytes served at URL;
+// the terminal verifies it against the public key compiled into its firmware
+// before it will boot the image, and installs only a Version newer than what
+// it runs. cmd/fwsign produces these (URL empty for a gateway-hosted image,
+// which internal/firmware fills in); firmware/src/ota_verify.h parses them.
 type FirmwareManifest struct {
 	Available bool   `json:"available"`
 	Version   string `json:"version,omitempty"`

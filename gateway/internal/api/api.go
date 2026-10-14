@@ -12,17 +12,24 @@ import (
 	"time"
 
 	"presence/internal/auth"
+	"presence/internal/firmware"
 	"presence/internal/model"
 	"presence/internal/store"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB; a 100-event batch is ~30 KiB
 
+// imageWriteTimeout replaces the server's WriteTimeout for an image download.
+// 30 s covers every JSON response; it does not cover ~770 KB to a terminal
+// on a school's uplink.
+const imageWriteTimeout = 10 * time.Minute
+
 type Server struct {
 	st     *store.Store
 	nonces auth.NonceCache
 	log    *slog.Logger
-	now    func() time.Time // injectable for tests
+	now    func() time.Time  // injectable for tests
+	fw     *firmware.Catalog // nil: no releases published; every device is told available=false
 }
 
 func NewServer(st *store.Store, nonces auth.NonceCache, log *slog.Logger) *Server {
@@ -31,6 +38,10 @@ func NewServer(st *store.Store, nonces auth.NonceCache, log *slog.Logger) *Serve
 
 // SetClock overrides the time source. Test-only.
 func (s *Server) SetClock(f func() time.Time) { s.now = f }
+
+// SetFirmware enables GET /v1/device/firmware from a release directory.
+// Call it before serving.
+func (s *Server) SetFirmware(c *firmware.Catalog) { s.fw = c }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
@@ -47,6 +58,8 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /v1/device/commands", s.signed(s.handleCommands))
 	mux.Handle("POST /v1/device/commands/{id}/result", s.signed(s.handleCommandResult))
 	mux.Handle("GET /v1/device/roster", s.signed(s.handleRoster))
+	mux.Handle("GET /v1/device/firmware", s.signed(s.handleFirmware))
+	mux.Handle("GET /v1/device/firmware/images/{sha256}", s.signed(s.handleFirmwareImage))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -142,7 +155,81 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, dev *st
 		s.problem(w, http.StatusInternalServerError, "", "internal error", s.now())
 		return
 	}
+	resp.FirmwareAvailable = s.firmwareAvailable(dev, req.FirmwareVersion)
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// firmwareAvailable is the heartbeat's cheap answer to "is there a newer
+// image for me?". A broken release directory must never fail a heartbeat,
+// which is the device's liveness signal, so errors are logged and read as no.
+func (s *Server) firmwareAvailable(dev *store.Device, current string) bool {
+	if s.fw == nil {
+		return false
+	}
+	m, err := s.fw.Offer(dev.FirmwareChannel, current)
+	if err != nil && !errors.Is(err, firmware.ErrBadCurrent) {
+		s.log.Error("firmware release", "err", err, "channel", dev.FirmwareChannel)
+	}
+	return err == nil && m.Available
+}
+
+// handleFirmware serves the manifest for the device's channel when its
+// release is newer than `current`. The manifest is the signer's output read
+// from disk; the gateway adds only the image path. Whether to install is the
+// terminal's decision: it also checks the signature, and a floor the gateway
+// does not know.
+func (s *Server) handleFirmware(w http.ResponseWriter, r *http.Request, dev *store.Device, body []byte) {
+	current := r.URL.Query().Get("current")
+	if current == "" {
+		s.problem(w, http.StatusBadRequest, "", "current is required", s.now())
+		return
+	}
+	if s.fw == nil {
+		s.writeJSON(w, http.StatusOK, model.FirmwareManifest{Available: false})
+		return
+	}
+	m, err := s.fw.Offer(dev.FirmwareChannel, current)
+	switch {
+	case errors.Is(err, firmware.ErrBadCurrent):
+		s.problem(w, http.StatusBadRequest, "", "current is not MAJOR.MINOR.PATCH", s.now())
+		return
+	case err != nil:
+		// A half-published release: say no rather than hand out a manifest
+		// whose image is missing or wrong. The device asks again next time.
+		s.log.Error("firmware release", "err", err, "channel", dev.FirmwareChannel, "device", dev.ID)
+		m = model.FirmwareManifest{Available: false}
+	}
+	s.writeJSON(w, http.StatusOK, m)
+}
+
+// handleFirmwareImage streams a published image. Images are named by their
+// sha256 and checked against it before a byte is sent; they are files the
+// release process wrote, never generated here.
+func (s *Server) handleFirmwareImage(w http.ResponseWriter, r *http.Request, dev *store.Device, body []byte) {
+	if s.fw == nil {
+		s.problem(w, http.StatusNotFound, "", "no such image", s.now())
+		return
+	}
+	sha := r.PathValue("sha256")
+	f, info, err := s.fw.OpenImage(sha)
+	switch {
+	case errors.Is(err, firmware.ErrNoImage):
+		s.problem(w, http.StatusNotFound, "", "no such image", s.now())
+		return
+	case err != nil:
+		s.log.Error("firmware image", "err", err, "sha256", sha, "device", dev.ID)
+		s.problem(w, http.StatusInternalServerError, "", "image unavailable", s.now())
+		return
+	}
+	defer f.Close()
+
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(imageWriteTimeout)); err != nil {
+		s.log.Warn("firmware image: cannot extend write deadline", "err", err)
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", `"`+sha+`"`)
+	s.log.Info("firmware image", "device", dev.ID, "sha256", sha, "bytes", info.Size())
+	http.ServeContent(w, r, "", info.ModTime(), f)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, dev *store.Device, body []byte) {
