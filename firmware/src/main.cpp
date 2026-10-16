@@ -50,6 +50,8 @@
 #include <WiFi.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_rom_sys.h>
+#include <esp_timer.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
 
@@ -159,6 +161,8 @@ class NvsOtaStateStore : public presence::OtaStateStore {
   }
 };
 
+void confirmDeadlineExpired(void*);
+
 class EspBootControl : public presence::OtaBootControl {
  public:
   bool markValid() override { return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK; }
@@ -173,11 +177,40 @@ class EspBootControl : public presence::OtaBootControl {
     esp_ota_mark_app_invalid_rollback_and_reboot();
     esp_restart();
   }
+  // esp_timer, not the task watchdog: the network task blocks for minutes
+  // by design (backoff, 15 s HTTP timeouts, a 775 KB download), so a TWDT
+  // would need feeding at every one of those points, and it would also reset
+  // a confirmed terminal whose network task merely stalled. The timer runs in
+  // the esp_timer task, which no application task can starve, and does one
+  // thing that is safe whatever state the image is in.
+  bool armConfirmDeadline(uint32_t ms) override {
+    if (timer_ == nullptr) {
+      esp_timer_create_args_t args = {};
+      args.callback = &confirmDeadlineExpired;
+      args.name = "ota_confirm";
+      if (esp_timer_create(&args, &timer_) != ESP_OK) return false;
+    }
+    return esp_timer_start_once(timer_, static_cast<uint64_t>(ms) * 1000) == ESP_OK;
+  }
+  void cancelConfirmDeadline() override {
+    if (timer_ != nullptr) esp_timer_stop(timer_);
+  }
+  void restartUnconfirmed() override {
+    // No Serial here: the UART driver's lock may be held by the task that
+    // hung. The ROM printf writes straight to the FIFO.
+    esp_rom_printf("OTA: confirm deadline passed, restarting into the previous image\n");
+    esp_restart();
+  }
+
+ private:
+  esp_timer_handle_t timer_ = nullptr;
 };
 
 NvsOtaStateStore g_otaStore;
 EspBootControl g_bootControl;
 presence::OtaGuard g_otaGuard(&g_otaStore, &g_bootControl, PRESENCE_OTA_CONFIRM_MS);
+
+void confirmDeadlineExpired(void*) { g_otaGuard.onConfirmDeadline(); }
 
 // Serialises OtaGuard and applyOta between the net task and, in the bench
 // build, the serial loader in loop(): two updates writing the idle slot at
@@ -566,9 +599,9 @@ OtaResult applyOta(Stream& in, const std::string& version, size_t size,
                    const uint8_t sha256[presence::kSha256Bytes],
                    const uint8_t signature[presence::kEd25519SignatureBytes], void (*ready)()) {
   OtaLock lock;  // one update at a time
-  // Refuse before erasing anything: with no key, nothing can ever verify.
-  if (presence::isUnprovisionedKey(presence::kOtaReleasePublicKey)) {
-    return {OtaOutcome::Rejected, "no release key compiled in"};
+  // Refuse before erasing anything: with no usable key, nothing may verify.
+  if (presence::isUnusableKey(presence::kOtaReleasePublicKey)) {
+    return {OtaOutcome::Rejected, "no usable release key compiled in"};
   }
   if (size == 0) return {OtaOutcome::Rejected, "empty image"};
   // Older, equal, at or below the floor, rolled back once, or arriving while
@@ -920,6 +953,11 @@ void setup() {
     case presence::OtaBootKind::AwaitingConfirm:
       Serial.printf("OTA: new image pending; rolls back unless the gateway answers within %u s\n",
                     static_cast<unsigned>(g_otaGuard.confirmTimeoutMs() / 1000));
+      if (!g_otaGuard.confirmDeadlineArmed()) {
+        // The network task's tick() still enforces the window, but a hung
+        // task would then leave the image unconfirmed until a power cycle.
+        Serial.println("OTA: WARNING: could not arm the confirm timer; relying on the network task");
+      }
       break;
     case presence::OtaBootKind::RolledBack:
       Serial.println("OTA: the last update did not stay booted; rolled back, and that image will not be retried");
@@ -962,8 +1000,12 @@ void setup() {
 
   // Loud on purpose: a terminal that leaves the desk like this can only ever
   // be updated by someone physically plugging into it.
-  if (presence::isUnprovisionedKey(presence::kOtaReleasePublicKey)) {
+  if (presence::isSentinelKey(presence::kOtaReleasePublicKey)) {
     Serial.println("WARNING: no OTA release key compiled in; over-the-air updates are disabled");
+  } else if (presence::isUnusableKey(presence::kOtaReleasePublicKey)) {
+    // A small-order key accepts a forged signature on any image, so it is
+    // refused like the sentinel. Reaching this means a bad key was pasted.
+    Serial.println("WARNING: the OTA release key is a small-order point; over-the-air updates are disabled");
   }
 
   if (!g_nvs.isKey("device_secret")) {

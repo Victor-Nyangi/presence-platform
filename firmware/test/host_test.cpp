@@ -1017,9 +1017,9 @@ static void testEmptyImageRejected() {
 static void testUnprovisionedKeyRefusesEverything() {
   printf("\nOTA: no release key compiled in\n");
   const uint8_t zero[32] = {0};
-  check(isUnprovisionedKey(zero), "the all-zero key is the unprovisioned sentinel");
+  check(isSentinelKey(zero) && isUnusableKey(zero), "the all-zero key is the sentinel, and unusable");
   const TestKey k = makeTestKey();
-  check(!isUnprovisionedKey(k.pk), "a real key is not");
+  check(!isSentinelKey(k.pk) && !isUnusableKey(k.pk), "a real key is neither");
 
   const std::vector<uint8_t> img = makeImage(4096);
   const std::vector<uint8_t> sig = signImage(k, img);
@@ -1032,6 +1032,75 @@ static void testUnprovisionedKeyRefusesEverything() {
       verifyStreamed(kOtaReleasePublicKey, sig.data(), img.size(), img.data(), img.size(), 4096);
   check(committed == OtaVerdict::NoKey || committed == OtaVerdict::BadSignature,
         "the committed release key refuses a test-key image");
+}
+
+// Every encoding of a point of order 1, 2, 4 or 8: the 8 canonical ones and
+// the 6 non-canonical ones (x = 0 with the sign bit set; y = p and y = p+1).
+// Recomputed from the curve equation, not copied from ota_verify.h, so a
+// typo in the blocklist fails here.
+static const char* kSmallOrderKeys[] = {
+    "0000000000000000000000000000000000000000000000000000000000000000",  // y=0, order 4
+    "0000000000000000000000000000000000000000000000000000000000000080",  // y=0, other x, order 4
+    "0100000000000000000000000000000000000000000000000000000000000000",  // identity
+    "0100000000000000000000000000000000000000000000000000000000000080",  // identity, non-canonical sign
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",  // order 8
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",  // order 8
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",  // order 8
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",  // order 8
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  // y=p-1, order 2
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",  // order 2, non-canonical sign
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  // y=p (=0), non-canonical
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",  // y=p, non-canonical
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  // y=p+1 (=1), non-canonical
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",  // y=p+1, non-canonical
+};
+
+// Monocypher's check is cofactored, so under a small-order key the signature
+// R = identity, S = 0 verifies on any message. The gate must refuse every
+// such key before the arithmetic runs.
+static void testSmallOrderKeysAreRefused() {
+  printf("\nOTA: small-order keys are unusable\n");
+  uint8_t forged[64] = {0};
+  forged[0] = 0x01;  // R = the identity (y = 1), S = 0
+  const std::vector<uint8_t> img = makeImage(4096);
+  const std::vector<uint8_t> msg = signedMessage(kTestVersion, img);
+
+  size_t refused = 0, primitiveForged = 0, streamRefused = 0, imageRefused = 0;
+  for (const char* hex : kSmallOrderKeys) {
+    uint8_t pk[32];
+    if (!decodeHexExact(hex, pk, 32)) continue;
+    if (isUnusableKey(pk) && isSmallOrderKey(pk)) refused++;
+    if (ed25519Verify(forged, pk, msg.data(), msg.size())) primitiveForged++;
+    if (!streamRaw(pk, forged, msg.data(), msg.size(), 4096)) streamRefused++;
+    if (verifyStreamed(pk, forged, img.size(), img.data(), img.size(), 4096) == OtaVerdict::NoKey) imageRefused++;
+  }
+  const size_t n = sizeof(kSmallOrderKeys) / sizeof(kSmallOrderKeys[0]);
+  check(n == 14 && refused == n, "all 14 small-order encodings are unusable keys");
+  check(primitiveForged == n,
+        "the raw primitive accepts the (R=identity, S=0) forgery under each (why the gate exists)");
+  check(streamRefused == n, "Ed25519Stream refuses the forgery under each");
+  check(imageRefused == n, "ImageVerifier refuses the forgery under each, as NoKey");
+
+  // Near misses and real keys are not caught by the blocklist.
+  uint8_t near[32];
+  decodeHexExact(kSmallOrderKeys[4], near, 32);
+  near[0] ^= 0x01;
+  bool realOk = !isUnusableKey(near);
+  for (int i = 0; i < 200; i++) realOk = realOk && !isUnusableKey(makeTestKey().pk);
+  check(realOk, "a key one bit off an order-8 point, and 200 real keys, are usable");
+}
+
+// The key every build trusts. Today it is the sentinel; the moment someone
+// pastes a key, this fails unless it is a real one.
+static void testCompiledInKeyIsNotSmallOrder() {
+  printf("\nOTA: the compiled-in key\n");
+  check(isSentinelKey(kOtaReleasePublicKey) || !isSmallOrderKey(kOtaReleasePublicKey),
+        "kOtaReleasePublicKey is the sentinel or not a small-order point");
+  uint8_t forged[64] = {0};
+  forged[0] = 0x01;
+  const std::vector<uint8_t> img = makeImage(1024);
+  check(verifyStreamed(kOtaReleasePublicKey, forged, img.size(), img.data(), img.size(), 4096) != OtaVerdict::Ok,
+        "and the (R=identity, S=0) forgery does not verify against it");
 }
 
 static void testVerifierIsSingleUse() {
@@ -1291,7 +1360,12 @@ class SimDevice : public OtaBootControl {
   int running = 0;
   int markValidCalls = 0;
   int rollbackCalls = 0;
+  int restartCalls = 0;
   bool failMarkValid = false;
+  // The esp_timer one-shot: armed for how long, and whether it is live.
+  bool timerArmed = false;
+  uint32_t timerMs = 0;
+  bool failArm = false;
   std::function<void()> onMarkValid;
 
   // `pio run -t upload`: app0 written, otadata reset. NVS is untouched.
@@ -1350,6 +1424,15 @@ class SimDevice : public OtaBootControl {
     rollbackCalls++;
     if (selectable(slot[idle()])) slot[running].state = ImgState::Invalid;
   }
+  bool armConfirmDeadline(uint32_t ms) override {
+    if (failArm) return false;
+    timerArmed = true;
+    timerMs = ms;
+    return true;
+  }
+  void cancelConfirmDeadline() override { timerArmed = false; }
+  // esp_restart(): nothing is written; the next bootloader() pass decides.
+  void restartUnconfirmed() override { restartCalls++; }
 };
 
 static const char* kOtaNvsPath = "/tmp/presence_fwtest_ota_state.bin";
@@ -1367,6 +1450,7 @@ struct SimTerminal {
   }
 
   OtaBootKind boot(uint32_t nowMs = 0) {
+    dev.timerArmed = false;  // timers do not survive a reset
     dev.bootloader();
     store.reset(new FileOtaStore(kOtaNvsPath));
     guard.reset(new OtaGuard(store.get(), &dev, confirmMs));
@@ -1597,6 +1681,81 @@ static void testConfirmWindowAcrossMillisWrap() {
   check(t.dev.rollbackCalls == 1, "the window still expires on time");
 }
 
+// A broken image's likeliest failure is a network task that hangs, and then
+// tick() never runs. The esp_timer deadline does not need that task.
+static void testHungNetworkTaskStillRollsBack() {
+  printf("\nOTA guard: the confirm deadline does not depend on the network task\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  check(t.boot() == OtaBootKind::Normal && !t.dev.timerArmed, "no timer for an image that is not pending");
+  t.install("0.3.0", 0x30);
+  t.boot();
+  check(t.dev.timerArmed && t.dev.timerMs == t.confirmMs && t.guard->confirmDeadlineArmed(),
+        "a pending image arms a one-shot timer for the whole window");
+
+  // The network task is hung: no tick(), no heartbeat. Only the timer fires.
+  t.guard->onConfirmDeadline();
+  check(t.dev.restartCalls == 1 && t.dev.rollbackCalls == 0, "the timer restarts the chip, nothing more");
+  check(t.boot() == OtaBootKind::RolledBack && t.dev.runningVersion() == "0.2.0",
+        "the restart lands on the previous image");
+  check(t.check("0.3.0", 0x30) == OtaCandidate::KnownBad, "and the image is blacklisted from NVS on that boot");
+}
+
+static void testConfirmCancelsTheDeadline() {
+  printf("\nOTA guard: confirming cancels the deadline\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.boot();
+  t.guard->onHealthy();
+  check(!t.dev.timerArmed && !t.guard->confirmDeadlineArmed(), "the first heartbeat cancels the timer");
+  t.guard->onConfirmDeadline();  // a callback already queued when it was cancelled
+  check(t.dev.restartCalls == 0, "a late callback after the confirm does nothing");
+
+  SimTerminal f;
+  f.dev.usbFlash("0.2.0", 0x20);
+  f.boot();
+  f.install("0.3.0", 0x30);
+  f.dev.failMarkValid = true;
+  f.boot();
+  f.guard->onHealthy();
+  check(f.dev.timerArmed, "a failed mark-valid leaves the deadline armed");
+}
+
+// The race the timer cannot avoid: it fires after markValid() but before the
+// guard has raised the floor. A restart then must keep the new image.
+static void testDeadlineRestartAfterMarkValidKeepsTheImage() {
+  printf("\nOTA guard: a deadline restart just after mark-valid\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.boot();
+  t.dev.markValid();  // the guard's markValid ran; nothing else did
+  check(t.boot() == OtaBootKind::Normal && t.dev.runningVersion() == "0.3.0",
+        "the restart boots the now-valid image, not the previous one");
+  t.guard->onHealthy();
+  check(t.storedFloor() == V("0.3.0") && t.check("0.3.0", 0x31) == OtaCandidate::NotNewer,
+        "the next heartbeat raises the floor and clears the pending record");
+  OtaPersistedState st;
+  FileOtaStore(kOtaNvsPath).load(&st);
+  check(!st.hasPending && !st.hasBad, "and nothing was blacklisted");
+}
+
+static void testUnarmableTimerFallsBackToTick() {
+  printf("\nOTA guard: no timer, the network task still enforces the window\n");
+  SimTerminal t;
+  t.dev.usbFlash("0.2.0", 0x20);
+  t.boot();
+  t.install("0.3.0", 0x30);
+  t.dev.failArm = true;
+  t.boot();
+  check(!t.guard->confirmDeadlineArmed(), "the guard knows the timer is not armed (main.cpp warns)");
+  t.guard->tick(t.confirmMs);
+  check(t.dev.rollbackCalls == 1, "tick() still rolls back at the deadline");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -1649,6 +1808,12 @@ int main() {
   testPendingRecordFailureBlocksTheCommit();
   testCorruptOtaStateStartsClean();
   testConfirmWindowAcrossMillisWrap();
+  testSmallOrderKeysAreRefused();
+  testCompiledInKeyIsNotSmallOrder();
+  testHungNetworkTaskStillRollsBack();
+  testConfirmCancelsTheDeadline();
+  testDeadlineRestartAfterMarkValidKeepsTheImage();
+  testUnarmableTimerFallsBackToTick();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;
