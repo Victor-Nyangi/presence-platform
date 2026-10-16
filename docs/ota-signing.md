@@ -36,8 +36,13 @@ not verify.
 
 On the terminal (`applyOta` in `firmware/src/main.cpp`), in this order:
 
-1. Refuse at once if the compiled-in key is the all-zero *unprovisioned* sentinel or the image
-   is empty.
+1. Refuse at once if the compiled-in key is unusable (`isUnusableKey`) or the image is empty.
+   Unusable means the all-zero *unprovisioned* sentinel or **any small-order point**, in any
+   of its 14 encodings (8 canonical, 6 non-canonical). Monocypher's check is cofactored,
+   `[8]([S]B − R − [h]A) = 0`, so under a small-order key the signature R = identity, S = 0
+   verifies on every message; the host tests show the raw primitive accepting exactly that
+   forgery under each encoding. A host test also fails if `ota_pubkey.h` ever holds a
+   small-order key other than the sentinel, and `fwsign` refuses to sign for one.
 2. **Downgrade check** (`OtaGuard::check`), before anything is erased. Refuse unless the signed
    version is strictly newer than the running build *and* strictly newer than the **floor** in
    NVS, which is the highest version that has ever proved healthy on this terminal. Also
@@ -65,6 +70,16 @@ bootloader (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`), and the sketch defines
    slot. A crash, watchdog reset or power cut inside the window does the same. The next boot
    notices that the pending version is not what is running, and records that image's sha256
    so it is never installed again.
+
+   The deadline is an `esp_timer` one-shot armed at boot, not only the network task's
+   `tick()`, because a broken image's likeliest failure is a hung network task, which would
+   otherwise leave the image unconfirmed until a power cycle. The callback runs in the
+   `esp_timer` task and only calls `esp_restart()`. That is safe in every state: a pending
+   image rolls back; an image confirmed a moment earlier boots again as itself. The task
+   watchdog was the alternative and was not chosen: the network task blocks for minutes by
+   design (backoff, HTTP timeouts, the download), so it would need feeding at each of those
+   points, and it would also reset a confirmed terminal whose network task merely stalled.
+   `tick()` stays as the in-task path and the fallback if the timer cannot be armed.
 
 The floor and the pending and rolled-back records are one NVS entry (`ota_state`), so they
 cannot tear apart, the way the ring cursors cannot. The floor only rises. An older build on
@@ -94,8 +109,9 @@ updates but cannot forge one.
 - Keep it out of cloud-synced folders, password-manager attachments that sync to a phone,
   dotfiles repos and shell history.
 - `fwsign` enforces part of this. `keygen` refuses to write inside any git work tree and
-  refuses to overwrite an existing file. `sign` and `pubkey` refuse a key file that group or
-  others can read, the way ssh does. The `.gitignore` is not what protects the key, and it
+  refuses to overwrite an existing file. `sign` and `pubkey` open the key file once, check
+  the open handle (a regular file, owned by you, not readable by group or others, the way ssh
+  does) and read from that same handle, so the file checked is the file read. The `.gitignore` is not what protects the key, and it
   shouldn't be.
 
 The public key is not secret. It is committed in `ota_pubkey.h` and compiled into every
@@ -142,7 +158,7 @@ IMG=firmware/.pio/build/esp32dev/firmware.bin
 ```
 
 `-header` makes `sign` fail if the key does not match the one the firmware compiles in, or if
-that header still holds the sentinel. Without the check you can publish an image that every
+that header still holds the sentinel or a small-order key. Without the check you can publish an image that every
 terminal will refuse. `sign` and `verify` also read the version the image was built as (the
 `PRESENCE_FW_VERSION=` marker every build carries) and fail if `-version` differs. A terminal
 trusts the signed version, so an image signed under the wrong one would install, report its
