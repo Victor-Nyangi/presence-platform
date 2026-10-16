@@ -320,6 +320,28 @@ func TestKeyFileSafety(t *testing.T) {
 		t.Fatal("loaded a world-readable key")
 	}
 
+	// Not a regular file, and implausibly large: refused from the handle.
+	if _, err := LoadPrivateKeyFile(dir); err == nil {
+		t.Fatal("loaded a directory as a key")
+	}
+	big := filepath.Join(dir, "big.pem")
+	os.WriteFile(big, bytes.Repeat([]byte("A"), maxKeyFileBytes+1), 0o600)
+	if _, err := LoadPrivateKeyFile(big); err == nil {
+		t.Fatal("loaded a 64 KiB key file")
+	}
+	// The file read is the file checked: a world-readable key behind a
+	// symlink is refused, because the mode comes from the open handle.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.pem")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPrivateKeyFile(link); err == nil {
+		t.Fatal("loaded a world-readable key through a symlink")
+	}
+
 	repo := filepath.Join(dir, "repo")
 	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -349,13 +371,66 @@ func TestHeaderRoundTrip(t *testing.T) {
 }
 
 // The committed header must parse, so `fwsign sign -header` works against
-// the real file and not just a test fixture.
+// the real file and not just a test fixture. And the key in it must be the
+// sentinel or a real key: today it is the sentinel, and this fails the
+// moment someone pastes a small-order key.
 func TestCommittedHeaderParses(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "..", "..", "firmware", "src", "ota_pubkey.h"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ParseHeaderKey(string(src)); err != nil {
+	pub, err := ParseHeaderKey(string(src))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !IsSentinel(pub) && IsSmallOrder(pub) {
+		t.Fatalf("ota_pubkey.h holds a small-order key %x", pub)
+	}
+}
+
+// Every encoding of a small-order point, canonical and not; the same list as
+// kSmallOrderKeys in firmware/test/host_test.cpp, recomputed from the curve.
+var smallOrderKeys = []string{
+	"0000000000000000000000000000000000000000000000000000000000000000",
+	"0000000000000000000000000000000000000000000000000000000000000080",
+	"0100000000000000000000000000000000000000000000000000000000000000",
+	"0100000000000000000000000000000000000000000000000000000000000080",
+	"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+	"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+	"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+	"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+	"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+	"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+	"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+	"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+}
+
+func TestSmallOrderKeysAreUnusable(t *testing.T) {
+	img := goldenImage()
+	forged := make([]byte, 64)
+	forged[0] = 0x01 // R = identity, S = 0: verifies under any small-order key in a cofactored check
+	sum := sha256.Sum256(img)
+	m := model.FirmwareManifest{Available: true, Version: "1.2.3", Size: int64(len(img)),
+		SHA256: hex.EncodeToString(sum[:]), Signature: hex.EncodeToString(forged)}
+	for _, k := range smallOrderKeys {
+		pub := ed25519.PublicKey(mustHex(t, k))
+		if !IsUnusable(pub) || !IsSmallOrder(pub) {
+			t.Errorf("%s is not flagged", k)
+		}
+		if err := Verify(pub, img, m); err == nil || !strings.Contains(err.Error(), "sentinel") && !strings.Contains(err.Error(), "small-order") {
+			t.Errorf("%s: Verify did not refuse the key itself: %v", k, err)
+		}
+	}
+	near := mustHex(t, smallOrderKeys[4])
+	near[0] ^= 1
+	if IsUnusable(near) {
+		t.Error("a key one bit off an order-8 point was flagged")
+	}
+	for i := 0; i < 200; i++ {
+		if pub := pubOf(newKey(t)); IsUnusable(pub) {
+			t.Fatalf("a real key %x was flagged", pub)
+		}
 	}
 }
