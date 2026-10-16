@@ -21,6 +21,16 @@
 //    the bootloader then falls back to the previous slot. A crash or a power
 //    cut inside the window has the same effect, which is the point.
 //
+//    The deadline does not depend on the network task being alive. begin()
+//    arms a one-shot timer (esp_timer on the device) for the whole window, and
+//    its callback only restarts the chip. A hung network task -- the likeliest
+//    way for a broken image to fail -- would otherwise never call tick() and
+//    the image would stay unconfirmed until someone power-cycled the
+//    terminal. A restart is safe in every state: while the image is pending
+//    the bootloader rolls it back; if it was confirmed a moment earlier, it
+//    boots the same, now valid, image. tick() remains as the in-task path that
+//    also records the rolled-back image before rebooting.
+//
 // Ordering rules, in the spirit of "commit the sequence number before use":
 //
 // - RECORD THE PENDING UPDATE BEFORE MAKING IT BOOTABLE. notePending() writes
@@ -82,6 +92,12 @@ class OtaBootControl {
   // Reboot WITHOUT confirming, so the bootloader falls back to the previous
   // slot. Returns only if it could not reboot (a host test, or a failure).
   virtual void rollback() = 0;
+  // A one-shot timer, independent of every application task, that calls
+  // OtaGuard::onConfirmDeadline() after ms. false if it could not be armed.
+  virtual bool armConfirmDeadline(uint32_t ms) = 0;
+  virtual void cancelConfirmDeadline() = 0;
+  // esp_restart() and nothing else: it runs in the timer's context.
+  virtual void restartUnconfirmed() = 0;
 };
 
 enum class OtaCandidate : uint8_t {
@@ -147,7 +163,11 @@ class OtaGuard {
       kind_ = OtaBootKind::RolledBack;
     }
     awaiting_ = pendingVerify;
-    if (awaiting_) kind_ = OtaBootKind::AwaitingConfirm;
+    deadlineArmed_ = false;
+    if (awaiting_) {
+      kind_ = OtaBootKind::AwaitingConfirm;
+      deadlineArmed_ = boot_ != nullptr && boot_->armConfirmDeadline(timeoutMs_);
+    }
     healthy_ = false;
     return kind_;
   }
@@ -191,6 +211,8 @@ class OtaGuard {
     if (awaiting_) {
       if (!boot_ || !boot_->markValid()) return;  // try again on the next heartbeat
       awaiting_ = false;
+      if (deadlineArmed_) boot_->cancelConfirmDeadline();
+      deadlineArmed_ = false;
     }
     healthy_ = true;
     bool dirty = false;
@@ -222,7 +244,16 @@ class OtaGuard {
     if (boot_) boot_->rollback();
   }
 
+  // onConfirmDeadline: the timer armed by begin() fired. Runs in the timer's
+  // context, possibly while another task is inside onHealthy(), so it reads
+  // one flag and restarts; it touches no NVS and takes no lock. That race is
+  // harmless (see the header comment): a restart is safe in every state.
+  void onConfirmDeadline() {
+    if (awaiting_ && boot_) boot_->restartUnconfirmed();
+  }
+
   bool awaitingConfirm() const { return awaiting_; }
+  bool confirmDeadlineArmed() const { return deadlineArmed_; }
   bool rollbackRequested() const { return rollbackRequested_; }
   bool healthy() const { return healthy_; }
   uint64_t floor() const { return st_.floor; }
@@ -240,7 +271,8 @@ class OtaGuard {
   OtaPersistedState st_;
   uint64_t running_ = 0;
   bool runningOk_ = false;
-  bool awaiting_ = false;
+  volatile bool awaiting_ = false;  // read by onConfirmDeadline from the timer task
+  bool deadlineArmed_ = false;
   bool healthy_ = false;
   bool rollbackRequested_ = false;
   uint32_t bootMs_ = 0;

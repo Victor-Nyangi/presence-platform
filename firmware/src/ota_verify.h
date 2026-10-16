@@ -74,19 +74,73 @@ inline bool decodeHexExact(const std::string& hex, uint8_t* out, size_t outLen) 
   return true;
 }
 
-// isUnprovisionedKey: the all-zero key is the "no release key compiled in"
-// sentinel. It must never reach the curve arithmetic -- zero decodes as a
-// small-order point, and a small-order public key lets an attacker forge a
-// signature by guessing among a handful of candidates. Refused outright.
-inline bool isUnprovisionedKey(const uint8_t publicKey[kEd25519PublicKeyBytes]) {
+// isSentinelKey: the all-zero key is the "no release key compiled in"
+// placeholder that ota_pubkey.h ships with. Only the boot warning and the
+// tests care about telling it apart; the gate is isUnusableKey.
+inline bool isSentinelKey(const uint8_t publicKey[kEd25519PublicKeyBytes]) {
   uint8_t acc = 0;
   for (size_t i = 0; i < kEd25519PublicKeyBytes; i++) acc |= publicKey[i];
   return acc == 0;
 }
 
+// isSmallOrderKey: the key encodes one of the 8 points of order 1, 2, 4 or 8.
+//
+// Monocypher's verification is cofactored: it checks [8]([S]B - R - [h]A) = 0.
+// For a small-order A, [8][h]A is the identity whatever h is, so the
+// signature R = identity, S = 0 verifies on EVERY message. A release key that
+// is a small-order point is therefore no key at all: anyone could sign an
+// image for it. (The host tests show the raw primitive accepting exactly that
+// forgery under each of these encodings.)
+//
+// The check compares y, with the x sign bit cleared, against the y of every
+// torsion point -- 1, p-1, 0 and the two order-8 values -- plus the
+// non-canonical p and p+1 (y = 0 and y = 1 again, unreduced). With both sign
+// bits that covers the 8 canonical encodings and the 6 non-canonical ones
+// (x = 0 with the sign bit set, and y >= p). y = p-1 + p does not fit in 255
+// bits, so no other non-canonical small-order encoding exists. The values are
+// libsodium's small-order blocklist, recomputed for this file.
+inline bool isSmallOrderKey(const uint8_t publicKey[kEd25519PublicKeyBytes]) {
+  static const uint8_t kSmallOrderY[7][kEd25519PublicKeyBytes] = {
+      // y = 0 (order 4)
+      {0},
+      // y = 1 (the identity, order 1)
+      {0x01},
+      // order 8
+      {0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+       0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05},
+      // order 8
+      {0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
+       0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a},
+      // y = p-1 (order 2)
+      {0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+      // y = p, a non-canonical 0
+      {0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+      // y = p+1, a non-canonical 1
+      {0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+  };
+  uint8_t y[kEd25519PublicKeyBytes];
+  memcpy(y, publicKey, sizeof(y));
+  y[31] &= 0x7f;  // the x sign bit
+  for (const auto& bad : kSmallOrderY) {
+    if (memcmp(y, bad, sizeof(y)) == 0) return true;
+  }
+  return false;
+}
+
+// isUnusableKey: the gate. The sentinel and every small-order key are refused
+// outright, before any curve arithmetic, because a signature "verifies"
+// against them without the private key ever existing.
+inline bool isUnusableKey(const uint8_t publicKey[kEd25519PublicKeyBytes]) {
+  return isSentinelKey(publicKey) || isSmallOrderKey(publicKey);
+}
+
 // ed25519Verify is the one-shot form, used for the RFC 8032 vectors. It is
-// the raw primitive and accepts an empty message; the OTA policy (no empty
-// images) lives in ImageVerifier.
+// the raw primitive: it accepts an empty message and it does NOT refuse
+// small-order keys. The OTA policy (no empty images, no unusable keys) lives
+// in Ed25519Stream and ImageVerifier, which are what main.cpp uses.
 inline bool ed25519Verify(const uint8_t signature[kEd25519SignatureBytes],
                           const uint8_t publicKey[kEd25519PublicKeyBytes], const uint8_t* msg,
                           size_t len) {
@@ -168,7 +222,7 @@ inline std::string otaSignedPreamble(const std::string& version, uint64_t size) 
 
 enum class OtaVerdict : uint8_t {
   Ok,
-  NoKey,         // the compiled-in key is the unprovisioned sentinel
+  NoKey,         // the compiled-in key is the sentinel or a small-order point
   EmptyImage,    // zero bytes expected or zero bytes seen
   SizeMismatch,  // bytes seen != size the manifest promised
   BadVersion,    // the version is not MAJOR.MINOR.PATCH, so it cannot be signed for
@@ -178,7 +232,7 @@ enum class OtaVerdict : uint8_t {
 inline const char* otaVerdictName(OtaVerdict v) {
   switch (v) {
     case OtaVerdict::Ok: return "ok";
-    case OtaVerdict::NoKey: return "no release key compiled in";
+    case OtaVerdict::NoKey: return "no usable release key compiled in";
     case OtaVerdict::EmptyImage: return "empty image";
     case OtaVerdict::SizeMismatch: return "image size does not match manifest";
     case OtaVerdict::BadVersion: return "version is not MAJOR.MINOR.PATCH";
@@ -188,8 +242,9 @@ inline const char* otaVerdictName(OtaVerdict v) {
 }
 
 // Ed25519Stream verifies a pure Ed25519 signature over a message fed in
-// pieces. It is the raw primitive, streamed: no policy, empty messages
-// allowed. The RFC 8032 vectors run through it.
+// pieces: the primitive, streamed, plus the one check no caller may skip --
+// an unusable key never verifies. Empty messages are allowed. The RFC 8032
+// vectors run through it.
 class Ed25519Stream {
  public:
   Ed25519Stream(const uint8_t publicKey[kEd25519PublicKeyBytes],
@@ -213,11 +268,11 @@ class Ed25519Stream {
     finished_ = true;
     uint8_t digest[64];
     crypto_sha512_final(&ctx_, digest);
-    if (isUnprovisionedKey(key_)) return false;
+    if (isUnusableKey(key_)) return false;
     uint8_t h[32];
     crypto_eddsa_reduce(h, digest);
-    // Rejects A or R off the curve and S >= L (malleability), then checks
-    // [S]B = R + [h]A.
+    // Rejects A or R off the curve and S >= L (malleability), then
+    // checks [8]([S]B - R - [h]A) = 0 (cofactored).
     return crypto_eddsa_check_equation(sig_, key_, h) == 0;
   }
 
@@ -245,7 +300,7 @@ class ImageVerifier {
                 size_t expectedSize)
       : stream_(publicKey, signature),
         expected_(expectedSize),
-        noKey_(isUnprovisionedKey(publicKey)),
+        noKey_(isUnusableKey(publicKey)),
         versionOk_(parseOtaVersion(version, nullptr)) {
     if (versionOk_) {
       const std::string pre = otaSignedPreamble(version, expectedSize);
