@@ -109,8 +109,11 @@ func headerKey(path string) (ed25519.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if fwsign.IsUnprovisioned(pub) {
+	switch {
+	case fwsign.IsSentinel(pub):
 		return nil, fmt.Errorf("%s holds the unprovisioned all-zero key; every terminal built from it refuses all updates", path)
+	case fwsign.IsSmallOrder(pub):
+		return nil, fmt.Errorf("%s holds a small-order key, which accepts forged signatures; every terminal built from it refuses all updates", path)
 	}
 	return pub, nil
 }

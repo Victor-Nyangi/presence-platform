@@ -163,19 +163,41 @@ func WriteNewKeyFile(path string, pemBytes []byte) error {
 	return f.Close()
 }
 
+// maxKeyFileBytes bounds the read: a PKCS#8 Ed25519 PEM is 119 bytes.
+const maxKeyFileBytes = 64 << 10
+
 // LoadPrivateKeyFile reads a key written by WriteNewKeyFile. Like ssh, it
-// refuses a file that group or others can read.
+// refuses anything but a regular file owned by the caller that group and
+// others cannot read.
+//
+// The checks run on the open handle (fstat), and the key is read from that
+// same handle. Stat-then-open would check one file and read another if the
+// path were swapped in between (a symlink, a rename on shared media).
 func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if err := ownedByCaller(info); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("%s is mode %#o; a signing key must be readable by its owner only (chmod 600)", path, info.Mode().Perm())
 	}
-	b, err := os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(f, maxKeyFileBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > maxKeyFileBytes {
+		return nil, fmt.Errorf("%s is larger than any Ed25519 key file", path)
 	}
 	return ParsePrivateKeyPEM(b)
 }
@@ -221,8 +243,8 @@ func Verify(pub ed25519.PublicKey, image []byte, m model.FirmwareManifest) error
 	if len(pub) != ed25519.PublicKeySize {
 		return errors.New("public key is not 32 bytes")
 	}
-	if IsUnprovisioned(pub) {
-		return errors.New("public key is the unprovisioned all-zero sentinel")
+	if err := CheckUsableKey(pub); err != nil {
+		return err
 	}
 	if len(image) == 0 {
 		return errors.New("empty image")
@@ -247,9 +269,65 @@ func Verify(pub ed25519.PublicKey, image []byte, m model.FirmwareManifest) error
 	return nil
 }
 
-// IsUnprovisioned matches the firmware's "no release key compiled in" sentinel.
-func IsUnprovisioned(pub ed25519.PublicKey) bool {
+// IsSentinel matches the firmware's "no release key compiled in" placeholder.
+func IsSentinel(pub ed25519.PublicKey) bool {
 	return bytes.Equal(pub, make([]byte, ed25519.PublicKeySize))
+}
+
+// smallOrderY are the y coordinates (x sign bit cleared) of every point of
+// order 1, 2, 4 or 8, plus the non-canonical p and p+1. The same list as
+// isSmallOrderKey in firmware/src/ota_verify.h.
+var smallOrderY = [][]byte{
+	mustDecodeHex("0000000000000000000000000000000000000000000000000000000000000000"), // y = 0, order 4
+	mustDecodeHex("0100000000000000000000000000000000000000000000000000000000000000"), // y = 1, identity
+	mustDecodeHex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"), // order 8
+	mustDecodeHex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"), // order 8
+	mustDecodeHex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // y = p-1, order 2
+	mustDecodeHex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // y = p, non-canonical 0
+	mustDecodeHex("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // y = p+1, non-canonical 1
+}
+
+func mustDecodeHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// IsSmallOrder reports whether pub encodes a point of small order, canonically
+// or not (14 encodings). The terminal's verifier is cofactored, so under such
+// a key the signature R = identity, S = 0 verifies on every message: a
+// small-order release key would let anyone sign firmware.
+func IsSmallOrder(pub ed25519.PublicKey) bool {
+	if len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	y := append([]byte(nil), pub...)
+	y[31] &= 0x7f
+	for _, bad := range smallOrderY {
+		if bytes.Equal(y, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsUnusable is the firmware's isUnusableKey: the sentinel or a small-order
+// point. A terminal refuses every update under such a key.
+func IsUnusable(pub ed25519.PublicKey) bool { return IsSentinel(pub) || IsSmallOrder(pub) }
+
+// CheckUsableKey explains why a key is unusable, or returns nil.
+func CheckUsableKey(pub ed25519.PublicKey) error {
+	switch {
+	case len(pub) != ed25519.PublicKeySize:
+		return errors.New("public key is not 32 bytes")
+	case IsSentinel(pub):
+		return errors.New("public key is the unprovisioned all-zero sentinel")
+	case IsSmallOrder(pub):
+		return errors.New("public key is a small-order point; it would accept forged signatures, and terminals refuse it")
+	}
+	return nil
 }
 
 // WriteManifest writes m as JSON. HTML escaping is off: Go would otherwise
