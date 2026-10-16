@@ -44,6 +44,12 @@ download. `esp32dev-debug` grew by 7,152 B (`firmware.bin` 817,136 → 824,288 B
 `OTA STATUS`/`OTA HEALTHY` commands. Both envs build with zero warnings, clean builds, same
 toolchain.
 
+**Review fixes (2026-10-16)**: the small-order key gate and the `esp_timer` confirm deadline
+added 1,064 B of flash and 16 B of static RAM to `esp32dev` (`firmware.bin` 776,464 B; app
+774,933 B; static RAM 40,012 B). `esp32dev-debug`: `firmware.bin` 824,912 B. Zero warnings,
+clean builds. Free in the OTA slot: **1,189,616 B (60.5%)**, `esp32dev-debug` 1,141,168 B
+(58.0%). The tables below are from 2026-10-14.
+
 The ring cap (2026-10-11) added 180 B of flash and no static RAM.
 
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.

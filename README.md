@@ -168,8 +168,8 @@ This covers the ring buffer (ack semantics, power-cut corruption, overflow, rebo
 
 Built 2026-10-11 with no hardware attached: PlatformIO Core 6.2.0, espressif32 6.13.0 (Arduino core 2.0.17 / ESP-IDF v4.4.7), board `esp32dev`, `min_spiffs.csv`. Both envs build with zero warnings. Details and method: [`docs/firmware-build.md`](docs/firmware-build.md).
 
-- **Size:** 773,869 B flash (39.4% of the app slot), 39,996 B static RAM (12.2%), including Ed25519 OTA verification (+22,360 B) and downgrade protection and rollback (+4,420 B), both 2026-10-14.
-- **OTA slack:** 1,190,672 B free in the 1,966,080 B OTA slot (60.6%). Under `default.csv` it would be 535,312 B (40.8%).
+- **Size:** 774,933 B flash (39.4% of the app slot), 40,012 B static RAM (12.2%), including Ed25519 OTA verification (+22,360 B), downgrade protection and rollback (+4,420 B, 2026-10-14) and the small-order key gate and rollback timer (+1,064 B, 2026-10-16).
+- **OTA slack:** 1,189,616 B free in the 1,966,080 B OTA slot (60.5%). Under `default.csv` it would be 534,256 B (40.8%).
 - **Buffer:** **953 records** under `min_spiffs`, 7,494 with a custom 896 KiB filesystem, 11,855 under `default` (was 1,911 / 15,018 / 23,756). littlefs is copy-on-write, so rewriting the ring file at offset 0 needs a whole file's worth of free blocks; the old size filled 31 of 32 blocks and the first `append()` failed with `LFS_ERR_NOSPC`, sending the terminal to `Fault`. `ringCapacityBytes` now derives the size from the filesystem geometry: `(blocks - metadata - 2 slack) / 2` ring blocks of `block_size - 8` bytes. Host emulation runs the new size through repeated full laps of appends with no `LFS_ERR_NOSPC`, at ~7.5 block erases per punch under `min_spiffs`.
 - **Pending on hardware:** the record count is still an estimate until a board prints its `punch buffer: N records` boot line (953 expected under `min_spiffs`), and punch latency from those erases has not been measured.
 
