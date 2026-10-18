@@ -237,9 +237,9 @@ do with esptool, and it exists only in that env.
 
 ## Verifying on hardware
 
-None of this has been run on a board. A bench board has no Wi-Fi (see *Known gaps*), so the
-serial loader stands in for the network path, and `serial_ota.py --confirm` stands in for the
-first gateway heartbeat. The `esp32dev-debug` env shortens the confirm window to 2 minutes.
+None of this has been run on a board. A freshly erased bench board has no Wi-Fi (it opens the
+setup portal instead; see *Known gaps*), so the serial loader stands in for the network path,
+and `serial_ota.py --confirm` stands in for the first gateway heartbeat. The `esp32dev-debug` env shortens the confirm window to 2 minutes.
 Keys and images go outside the repo (here `~/ota-bench/`):
 
 ```bash
@@ -304,11 +304,10 @@ otherwise:
 - **Not run on a board.** Downgrade protection, rollback and the gateway endpoint are
   host-tested and the gateway side is tested end to end against Postgres; the hardware steps
   above have not been run.
-- **The terminal never calls `WiFi.begin()`.** Neither the SPEC nor the device config defines
-  Wi-Fi credentials or how they are provisioned (the PROVISION state is about the device
-  secret), so the network OTA path, now complete on both sides, still cannot run on a board.
-  The bench serial loader remains the test path. On such a board a new image can never send a
-  heartbeat, so without `--confirm` it always rolls back, which is the safe failure.
+- **Wi-Fi comes from the SoftAP setup portal (2026-10-18), also not run on a board.** Until a
+  board has joined a network through it ([`wifi-provisioning.md`](wifi-provisioning.md)), the
+  bench serial loader remains the test path. On a board with no Wi-Fi a new image can never
+  send a heartbeat, so without `--confirm` it always rolls back, which is the safe failure.
 - **The floor is software, in NVS.** It stops a replayed image over the air. It does not stop
   someone with USB access, who can erase NVS or flash anything; that needs secure boot and
   eFuse anti-rollback (`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK`, off in this core's sdkconfig and
