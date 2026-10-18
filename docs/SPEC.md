@@ -182,6 +182,12 @@ Two FreeRTOS tasks. **The scan loop never blocks on the network** — this is th
                         FEEDBACK ────────────────────┘
                      (beep + LED + name)
 
+   Network task, before anything else:
+     [Wi-Fi credentials in NVS?] ──no──► WIFI_SETUP (SoftAP captive portal)
+         ──► form saved + read back ──► reboot into station mode
+         ──► window passes unused ──► AP off, offline until power cycle
+     BOOT held 10 s ──► erase Wi-Fi credentials only ──► reboot into WIFI_SETUP
+
    Side states, entered from READY on command:
      ENROLL ──► capture ×2 ──► store slot ──► upload template ──► READY
      OTA    ──► newer? ──► download ──► verify sha256 + Ed25519 ──► flash ──► reboot
@@ -204,6 +210,8 @@ Never touches the scan loop's state directly; they communicate through the flash
 **Buffer:** fixed-size 60-byte records in a LittleFS ring file, CRC32 per record, head/tail in NVS. Fixed-size records give O(1) append and no fragmentation. The ring file is preallocated at full size on first boot, so running out of space fails at startup rather than mid-outage.
 
 **Capacity is set by the partition table, not the flash size.** `min_spiffs.csv` spends a 4MB part on two 1.875MB OTA app slots and leaves roughly 128KB for the filesystem — on the order of 2,000 events, or about two days for a 500-person site punching twice daily. That clears the bar, but by far less margin than "4MB of flash" suggests. The firmware sizes the ring from whatever the partition actually reports rather than a hard-coded number, so trading app space for filesystem later grows the buffer with no code change; the terminal prints its real record count at boot. Any such trade has to be measured against the OTA rollback budget, since shrinking the app slots below what the firmware needs bricks the build.
+
+**Wi-Fi provisioning (decided 2026-10-18).** A terminal with no usable Wi-Fi credentials in NVS — first boot, or after BOOT is held for 10 s — opens an open access point named `presence-` plus the last three bytes of its MAC, answers every DNS name with its own address, and serves exactly one form: SSID and password. A valid submission is written to NVS as one entry and read back before the page says "saved"; then the terminal restarts into station mode. The window is bounded (10 minutes): if nothing is saved, the AP goes down and the terminal stays offline until it is power-cycled. The portal serves nothing else — no OTA, no punch data, no device API — and never logs or echoes the password. It runs on the network task, so the scan loop is unaffected. The gateway URL is a build constant, not a portal field, and the reset erases only the Wi-Fi entry, never the buffer, sequence counter, secret or OTA floor. Design, open choices and the bench checklist: [`wifi-provisioning.md`](wifi-provisioning.md).
 
 **Sequence counter:** in NVS, `commit → then use`. If power drops between commit and use you burn a number, which is harmless. The reverse order would reuse one, which silently destroys idempotency.
 

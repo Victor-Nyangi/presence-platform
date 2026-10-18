@@ -52,6 +52,25 @@ clean builds. Free in the OTA slot: **1,189,616 B (60.5%)**, `esp32dev-debug` 1,
 
 The ring cap (2026-10-11) added 180 B of flash and no static RAM.
 
+**Wi-Fi provisioning (2026-10-18)** is the biggest jump so far, and most of it is not the portal.
+`esp32dev`: app **1,065,233 B (54.2% of the slot)**, `firmware.bin` 1,071,808 B, static RAM
+48,012 B; `esp32dev-debug`: app 1,115,021 B (56.7%), `firmware.bin` 1,121,600 B, static RAM
+48,020 B. Zero warnings, clean builds, same toolchain. Against main (app 774,933 B) that is
++290,300 B of flash and +8,000 B of static RAM, split like this, measured with a control build of
+main plus only `WiFi.mode(WIFI_STA)` / `WiFi.begin()`:
+
+| | App | Δ |
+|---|---|---|
+| main | 774,933 B | |
+| main + station bring-up only | 1,041,905 B | **+266,972 B**: the Wi-Fi driver, WPA supplicant and the rest of lwIP, which no earlier build ever started and the linker therefore dropped |
+| this change (station + SoftAP portal) | 1,065,233 B | +23,328 B: SoftAP, DNSServer, WiFiServer, the portal |
+
+So every OTA-slack figure on this page from before 2026-10-18 was measured on an image that could
+not use Wi-Fi at all. **Free in the OTA slot now: 900,847 B (45.8%)**, `esp32dev-debug` 851,059 B
+(43.3%). Under the 2 × `0x180000` custom scheme in the table below that would leave 507,631 B
+(32.3%); under `default.csv`, 245,487 B (18.7%). TLS (mbedTLS handshakes against a real gateway)
+is already linked, because `HTTPClient` was, so this should be most of the network stack's cost.
+
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack
@@ -68,8 +87,9 @@ verification). `esp32dev-debug` leaves 1,141,792 B (58.1%).
 
 Now in the image: OTA download (signed, from the gateway), flash read-back, sha256 and
 Ed25519 verification over the version preamble and image, the downgrade floor and the
-boot-confirm rollback (`docs/ota-signing.md`). Not yet in it, and all of these will grow it: command handling, Wi-Fi
-bring-up, and the display/RFID drivers.
+boot-confirm rollback (`docs/ota-signing.md`). Wi-Fi bring-up and the setup portal are now in it too (2026-10-18, above; the table predates
+them). Not yet in it, and all of these will grow it: command handling and the display/RFID
+drivers.
 
 ## Ring-buffer capacity
 
