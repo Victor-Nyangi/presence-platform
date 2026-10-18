@@ -7,7 +7,8 @@
 // flash. Those need hardware. The OTA gate (ota_verify.h) IS covered: the
 // same Monocypher sources the terminal links are compiled in here. So is the
 // OTA downgrade and rollback state machine (ota_guard.h), against a
-// simulated two-slot flash, bootloader and file-backed NVS.
+// simulated two-slot flash, bootloader and file-backed NVS. And the Wi-Fi
+// setup portal (wifi_provision.h): everything but the radio and sockets.
 
 #include <cassert>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include "../src/ota_pubkey.h"
 #include "../src/ota_verify.h"
 #include "../src/ring_buffer.h"
+#include "../src/wifi_provision.h"
 #include "rfc8032_vectors.h"
 
 using namespace presence;
@@ -1756,6 +1758,442 @@ static void testUnarmableTimerFallsBackToTick() {
   check(t.dev.rollbackCalls == 1, "tick() still rolls back at the deadline");
 }
 
+// ---------------------------------------------------------------------
+// Wi-Fi provisioning (wifi_provision.h): the SoftAP captive portal's
+// validation, NVS record, form and HTTP parsing, routing, state machine and
+// the BOOT-button reset trigger. The radio, DNS and sockets (wifi_softap.h)
+// need a board; docs/wifi-provisioning.md has the bench checklist.
+// ---------------------------------------------------------------------
+class MemWifiStore : public WifiCredentialStore {
+ public:
+  bool load(WifiCredentials* out) override {
+    if (!has) return false;
+    *out = rec;
+    if (corruptOnLoad) out->password[0] ^= 0x01;
+    return true;
+  }
+  bool save(const WifiCredentials& c) override {
+    saves++;
+    if (failSave) return false;
+    rec = c;
+    has = true;
+    return true;
+  }
+  bool erase() override {
+    has = false;
+    memset(&rec, 0, sizeof(rec));
+    return true;
+  }
+  WifiCredentials rec{};
+  bool has = false;
+  bool failSave = false;
+  bool corruptOnLoad = false;  // a read-back that does not match the write
+  int saves = 0;
+};
+
+static std::string statusLine(const std::string& resp) { return resp.substr(0, resp.find("\r\n")); }
+
+static std::string bodyOf(const std::string& resp) {
+  const size_t p = resp.find("\r\n\r\n");
+  return p == std::string::npos ? std::string() : resp.substr(p + 4);
+}
+
+static std::string post(const std::string& path, const std::string& body) {
+  return "POST " + path + " HTTP/1.1\r\nHost: 192.168.4.1\r\nContent-Type: application/x-www-form-urlencoded\r\n" +
+         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+}
+
+static std::string get(const std::string& path, const char* method = "GET") {
+  return std::string(method) + " " + path + " HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\n\r\n";
+}
+
+// Feed a raw request through the parser and the portal, as serveOne does.
+static std::string ask(WifiPortal& p, const std::string& raw, uint32_t nowMs = 1000) {
+  HttpRequest req;
+  const HttpParse parsed = parseHttpRequest(raw.data(), raw.size(), &req);
+  return p.handle(parsed, req, nowMs);
+}
+
+static const char* kOrigin = "http://192.168.4.1/";
+
+static void testWifiFieldValidation() {
+  printf("\nWi-Fi provisioning: SSID and password validation\n");
+  check(validateSsid("", 0) == WifiFieldError::SsidMissing, "an empty SSID is refused");
+  const std::string s32(32, 'a'), s33(33, 'a');
+  check(validateSsid(s32.data(), 32) == WifiFieldError::Ok, "a 32-byte SSID is accepted");
+  check(validateSsid(s33.data(), 33) == WifiFieldError::SsidTooLong, "a 33-byte SSID is refused");
+  check(validateSsid("ab\ncd", 5) == WifiFieldError::SsidBadByte, "an SSID with a control character is refused");
+  check(validateSsid("a\x7f", 2) == WifiFieldError::SsidBadByte, "an SSID with DEL is refused");
+  const std::string utf8 = "Caf\xc3\xa9 Wi-Fi";
+  check(validateSsid(utf8.data(), utf8.size()) == WifiFieldError::Ok, "a UTF-8 SSID is accepted");
+  check(validateSsid(" spaced ", 8) == WifiFieldError::Ok, "leading and trailing spaces are kept, not refused");
+
+  check(validatePassword("", 0) == WifiFieldError::Ok, "an empty password means an open network");
+  check(validatePassword("1234567", 7) == WifiFieldError::PasswordTooShort, "a 7-character password is refused");
+  check(validatePassword("12345678", 8) == WifiFieldError::Ok, "an 8-character passphrase is accepted");
+  const std::string p63(63, 'x'), p65(65, 'x'), hex64(64, 'a'), notHex64(64, 'g');
+  check(validatePassword(p63.data(), 63) == WifiFieldError::Ok, "a 63-character passphrase is accepted");
+  check(validatePassword(hex64.data(), 64) == WifiFieldError::Ok, "a 64-digit hex key is accepted");
+  check(validatePassword(notHex64.data(), 64) == WifiFieldError::PasswordBadHex,
+        "64 characters that are not hex are refused");
+  check(validatePassword(p65.data(), 65) == WifiFieldError::PasswordTooLong, "a 65-character password is refused");
+  check(validatePassword("passw\xc3\xb6rd", 10) == WifiFieldError::PasswordBadByte,
+        "a non-ASCII passphrase is refused (WPA2 passphrases are printable ASCII)");
+  check(validatePassword("pass\tword", 9) == WifiFieldError::PasswordBadByte, "a tab in a passphrase is refused");
+  check(validatePassword("pa ss wo rd", 11) == WifiFieldError::Ok, "spaces in a passphrase are allowed");
+}
+
+static void testWifiCredentialRecord() {
+  printf("\nWi-Fi provisioning: the NVS record\n");
+  check(sizeof(WifiCredentials) == 102, "WifiCredentials is 102 bytes (a layout change needs a new magic)");
+  WifiCredentials c;
+  check(makeCredentials("school", "correct horse", &c) == WifiFieldError::Ok, "valid input makes a record");
+  check(c.magic == kWifiCredentialsMagic && strcmp(c.ssid, "school") == 0 && strcmp(c.password, "correct horse") == 0,
+        "the record carries the magic, SSID and password");
+  check(credentialsUsable(c), "a record this build wrote is usable");
+
+  WifiCredentials bad;
+  memset(&bad, 0x55, sizeof(bad));
+  check(makeCredentials("school", "short", &bad) == WifiFieldError::PasswordTooShort, "invalid input is refused");
+  bool allZero = true;
+  for (size_t i = 0; i < sizeof(bad); i++) allZero = allZero && reinterpret_cast<uint8_t*>(&bad)[i] == 0;
+  check(allZero, "a refused record is left all zero");
+
+  WifiCredentials m = c;
+  m.magic ^= 1;
+  check(!credentialsUsable(m), "a record with the wrong magic is not usable");
+  m = c;
+  memset(m.ssid, 'a', sizeof(m.ssid));
+  check(!credentialsUsable(m), "an SSID with no terminator is not usable");
+  m = c;
+  memset(m.password, 'a', sizeof(m.password));
+  check(!credentialsUsable(m), "a password with no terminator is not usable");
+  m = c;
+  m.ssid[0] = '\0';
+  check(!credentialsUsable(m), "an empty stored SSID is not usable");
+  m = c;
+  strcpy(m.password, "abc");
+  check(!credentialsUsable(m), "a stored password that would not validate is not usable");
+}
+
+static void testWifiBootDecision() {
+  printf("\nWi-Fi provisioning: the boot decision\n");
+  MemWifiStore store;
+  WifiCredentials out;
+  check(!loadUsableCredentials(&store, &out), "nothing stored: open the portal");
+  check(!loadUsableCredentials(nullptr, &out), "no store at all: open the portal");
+
+  makeCredentials("ward-3", "nightshift", &store.rec);
+  store.has = true;
+  check(loadUsableCredentials(&store, &out) && strcmp(out.ssid, "ward-3") == 0, "stored credentials: station mode");
+
+  store.rec.ssid[0] = '\0';  // torn or foreign entry
+  memset(&out, 0x55, sizeof(out));
+  check(!loadUsableCredentials(&store, &out), "an unusable stored entry opens the portal");
+  check(out.magic == 0 && out.password[0] == '\0', "and the rejected entry is zeroed, not left in memory");
+
+  store.erase();
+  check(!loadUsableCredentials(&store, &out), "after the BOOT-button erase: the portal opens again");
+}
+
+static void testWifiFormParsing() {
+  printf("\nWi-Fi provisioning: form parsing\n");
+  WifiForm f;
+  const std::string b1 = "ssid=My+School&password=p%40ss%26w%3Drd%25";
+  check(parseWifiForm(b1.data(), b1.size(), &f) == FormError::Ok, "a form with escapes parses");
+  check(f.ssid == "My School", "'+' decodes to a space");
+  check(f.password == "p@ss&w=rd%", "%XX escapes decode, including & = and %");
+
+  WifiForm g;
+  const std::string b2 = "password=12345678&ssid=net&submit=Save";
+  check(parseWifiForm(b2.data(), b2.size(), &g) == FormError::Ok && g.ssid == "net" && g.password == "12345678",
+        "field order does not matter and unknown fields are ignored");
+
+  WifiForm open;
+  const std::string b3 = "ssid=cafe&password=";
+  check(parseWifiForm(b3.data(), b3.size(), &open) == FormError::Ok && open.password.empty(),
+        "an empty password field is an open network");
+
+  struct Case {
+    const char* body;
+    FormError want;
+    const char* name;
+  } cases[] = {
+      {"ssid=net", FormError::Missing, "no password field at all is refused, not taken as an open network"},
+      {"password=12345678", FormError::Missing, "no ssid field is refused"},
+      {"", FormError::Missing, "an empty body is refused"},
+      {"ssid=a&ssid=b&password=12345678", FormError::Duplicate, "a duplicated ssid is refused"},
+      {"ssid=a&password=12345678&password=x", FormError::Duplicate, "a duplicated password is refused"},
+      {"ssid=a%zz&password=12345678", FormError::Malformed, "a bad escape is refused"},
+      {"ssid=a&password=1234567%", FormError::Malformed, "a truncated escape at the end is refused"},
+      {"ssid=a&password=1234567%4", FormError::Malformed, "a one-digit escape is refused"},
+  };
+  for (const Case& c : cases) {
+    WifiForm h;
+    const FormError got = parseWifiForm(c.body, strlen(c.body), &h);
+    check(got == c.want, c.name);
+    check(got == FormError::Ok || (h.ssid.empty() && h.password.empty()), "  and nothing is kept from it");
+  }
+
+  WifiForm big;
+  const std::string longBody = "ssid=a&password=" + std::string(200, 'x');
+  check(parseWifiForm(longBody.data(), longBody.size(), &big) == FormError::FieldTooLong,
+        "an over-long value is refused without growing past the cap");
+
+  WifiForm amp;
+  const std::string b4 = "&&ssid=a&&password=12345678&";
+  check(parseWifiForm(b4.data(), b4.size(), &amp) == FormError::Ok, "empty pairs between '&' are skipped");
+}
+
+static void testHttpRequestParsing() {
+  printf("\nWi-Fi provisioning: HTTP request parsing\n");
+  HttpRequest r;
+  std::string raw = get("/generate_204?x=1");
+  check(parseHttpRequest(raw.data(), raw.size(), &r) == HttpParse::Ok && r.method == "GET" &&
+            r.path == "/generate_204" && r.body.empty(),
+        "a GET parses and the query string is dropped from the path");
+
+  raw = post("/save", "ssid=a&password=12345678");
+  check(parseHttpRequest(raw.data(), raw.size(), &r) == HttpParse::Ok && r.method == "POST" && r.path == "/save" &&
+            r.body == "ssid=a&password=12345678",
+        "a POST parses with exactly Content-Length bytes of body");
+
+  check(parseHttpRequest(raw.data(), raw.size() - 3, &r) == HttpParse::Incomplete,
+        "a body still arriving is Incomplete, not truncated");
+  check(parseHttpRequest(raw.data(), 20, &r) == HttpParse::Incomplete, "a head still arriving is Incomplete");
+
+  const std::string lower = "POST /save HTTP/1.1\r\ncontent-LENGTH: 3\r\n\r\nabcEXTRA";
+  check(parseHttpRequest(lower.data(), lower.size(), &r) == HttpParse::Ok && r.body == "abc",
+        "header names are case-insensitive, and bytes past Content-Length are ignored");
+
+  struct Case {
+    std::string raw;
+    HttpParse want;
+    const char* name;
+  } cases[] = {
+      {"POST /save HTTP/1.1\r\nContent-Length: 513\r\n\r\n", HttpParse::TooLarge, "a body over 512 bytes is refused"},
+      {"POST /save HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n", HttpParse::TooLarge,
+       "a huge Content-Length does not overflow"},
+      {"GET / HTTP/1.1\r\nX: " + std::string(1100, 'a') + "\r\n\r\n", HttpParse::TooLarge, "a head over 1 KB is refused"},
+      {"GET / HTTP/1.1\r\nX: " + std::string(1100, 'a'), HttpParse::TooLarge,
+       "an over-long head is refused before its end arrives"},
+      {"POST /save HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", HttpParse::Bad, "chunked bodies are refused"},
+      {"POST /save HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na", HttpParse::Bad,
+       "two Content-Length headers are refused"},
+      {"POST /save HTTP/1.1\r\nContent-Length: 1x\r\n\r\na", HttpParse::Bad, "a non-numeric Content-Length is refused"},
+      {"get / HTTP/1.1\r\n\r\n", HttpParse::Bad, "a lower-case method is refused"},
+      {"GET http://evil/ HTTP/1.1\r\n\r\n", HttpParse::Bad, "an absolute-form target is refused"},
+      {"GET / HTTP/2.0\r\n\r\n", HttpParse::Bad, "a non-HTTP/1 version is refused"},
+      {"GET /\r\n\r\n", HttpParse::Bad, "a request line without a version is refused"},
+      {"GET / HTTP/1.1\r\nNoColon\r\n\r\n", HttpParse::Bad, "a header without a colon is refused"},
+      {"GET /a\x01 HTTP/1.1\r\n\r\n", HttpParse::Bad, "a control byte in the target is refused"},
+  };
+  for (const Case& c : cases) {
+    HttpRequest q;
+    check(parseHttpRequest(c.raw.data(), c.raw.size(), &q) == c.want, c.name);
+  }
+}
+
+static void testPortalServesNothingElse() {
+  printf("\nWi-Fi provisioning: the portal's whole surface\n");
+  check(routePortal("GET", "/") == PortalRoute::Form, "GET / is the form");
+  check(routePortal("HEAD", "/") == PortalRoute::Form, "HEAD / is the form");
+  check(routePortal("POST", "/save") == PortalRoute::Save, "POST /save saves");
+  check(routePortal("POST", "/") == PortalRoute::MethodNotAllowed, "POST / is 405");
+  check(routePortal("PUT", "/save") == PortalRoute::MethodNotAllowed, "PUT /save is 405");
+  check(routePortal("GET", "/save") == PortalRoute::Redirect, "GET /save goes back to the form");
+  for (const char* probe : {"/generate_204", "/hotspot-detect.html", "/connecttest.txt", "/ncsi.txt"}) {
+    check(routePortal("GET", probe) == PortalRoute::Redirect, (std::string("captive probe redirects: ") + probe).c_str());
+  }
+
+  MemWifiStore store;
+  makeCredentials("stored-net", "stored-secret", &store.rec);
+  store.has = true;
+  WifiPortal p(&store, "presence-ABCDEF", 600000);
+  p.begin(0, kOrigin);
+  // The device API, OTA, and anything that might hold punch data or the
+  // stored credentials: none of it exists on the portal.
+  const char* sensitive[] = {"/v1/device/firmware", "/v1/device/events", "/v1/device/heartbeat", "/update",
+                             "/ota",                "/firmware",         "/punches",             "/status",
+                             "/wifi",               "/config",           "/save/../update"};
+  for (const char* path : sensitive) {
+    const std::string g = ask(p, get(path));
+    check(statusLine(g) == "HTTP/1.1 302 Found" && contains(g, "Location: http://192.168.4.1/\r\n") &&
+              bodyOf(g).empty(),
+          (std::string("GET ") + path + " is only a redirect to the form, with no body").c_str());
+    const std::string q = ask(p, post(path, "x=1"));
+    check(statusLine(q) == "HTTP/1.1 404 Not Found" && bodyOf(q).empty(),
+          (std::string("POST ") + path + " is 404 with no body").c_str());
+  }
+  const std::string form = ask(p, get("/"));
+  check(!contains(form, "stored-net") && !contains(form, "stored-secret"),
+        "the form never shows the credentials already stored");
+  check(contains(form, "Content-Security-Policy: default-src 'none'") && !contains(form, "<script"),
+        "the page carries no script and a CSP that forbids one");
+}
+
+static void testPortalSaveFlow() {
+  printf("\nWi-Fi provisioning: save, read back, restart\n");
+  MemWifiStore store;
+  WifiPortal p(&store, "presence-0A0B0C", 600000, 1500);
+  check(p.state() == PortalState::Idle, "the portal starts idle");
+  p.begin(1000, kOrigin);
+  check(p.state() == PortalState::Open, "begin opens it");
+
+  const std::string form = ask(p, get("/"));
+  check(statusLine(form) == "HTTP/1.1 200 OK" && contains(form, "name=\"ssid\"") &&
+            contains(form, "name=\"password\" type=\"password\"") && contains(form, "presence-0A0B0C"),
+        "GET / serves the SSID and password form, naming the terminal");
+  const std::string headResp = ask(p, get("/", "HEAD"));
+  check(statusLine(headResp) == "HTTP/1.1 200 OK" && bodyOf(headResp).empty() &&
+            !contains(headResp, "Content-Length: 0\r\n"),
+        "HEAD / sends the headers and no body");
+
+  const std::string saved = ask(p, post("/save", "ssid=Clinic+Main&password=s3cret-Pass%21"), 5000);
+  check(statusLine(saved) == "HTTP/1.1 200 OK" && contains(saved, "Clinic Main"), "a valid form is saved");
+  check(!contains(saved, "s3cret-Pass"), "the saved page never echoes the password");
+  check(store.has && strcmp(store.rec.ssid, "Clinic Main") == 0 && strcmp(store.rec.password, "s3cret-Pass!") == 0,
+        "the credentials are in the store");
+  check(p.state() == PortalState::Saved, "the portal is Saved");
+  check(p.tick(6499) == PortalAction::None, "no restart before the response has had time to reach the phone");
+  check(p.tick(6500) == PortalAction::Reboot, "then restart into station mode");
+
+  const std::string again = ask(p, post("/save", "ssid=Other&password=different1"), 6000);
+  check(strcmp(store.rec.ssid, "Clinic Main") == 0 && store.saves == 1,
+        "a second submission after a save does not overwrite it");
+  check(contains(again, "Clinic Main") && contains(ask(p, get("/")), "Clinic Main"),
+        "and the portal keeps answering with the saved page");
+
+  WifiCredentials boot;
+  check(loadUsableCredentials(&store, &boot) && strcmp(boot.ssid, "Clinic Main") == 0,
+        "the next boot finds the saved network and joins it");
+}
+
+static void testPortalRejectsBadInput() {
+  printf("\nWi-Fi provisioning: bad input keeps the portal open\n");
+  MemWifiStore store;
+  WifiPortal p(&store, "presence-000001", 600000);
+  p.begin(0, kOrigin);
+
+  const std::string shortPw = ask(p, post("/save", "ssid=Ward+7&password=abc1234"));
+  check(statusLine(shortPw) == "HTTP/1.1 400 Bad Request" && contains(shortPw, "at least 8 characters"),
+        "a short password is refused with a reason");
+  check(contains(shortPw, "value=\"Ward 7\"") && !contains(shortPw, "abc1234"),
+        "the SSID is filled back in and the password is not");
+  check(!store.has && store.saves == 0 && p.state() == PortalState::Open, "nothing is stored and the portal stays open");
+
+  const std::string xss = ask(p, post("/save", "ssid=%3Cscript%3E%22x&password=1"));
+  check(contains(xss, "value=\"&lt;script&gt;&quot;x\"") && !contains(xss, "<script>"),
+        "an SSID echoed back is HTML-escaped");
+  const std::string ctl = ask(p, post("/save", "ssid=a%0Ab&password=12345678"));
+  check(contains(ctl, "control character") && contains(ctl, "value=\"\""),
+        "an SSID with a control byte is refused and not echoed");
+  const std::string dup = ask(p, post("/save", "ssid=a&ssid=b&password=12345678"));
+  check(statusLine(dup) == "HTTP/1.1 400 Bad Request" && !store.has, "a duplicated field is refused");
+
+  check(statusLine(p.handle(HttpParse::Incomplete, HttpRequest(), 0)) == "HTTP/1.1 408 Request Timeout",
+        "a request that never finished arriving is 408");
+  check(statusLine(p.handle(HttpParse::Bad, HttpRequest(), 0)) == "HTTP/1.1 400 Bad Request",
+        "an unparseable request is 400");
+  check(statusLine(p.handle(HttpParse::TooLarge, HttpRequest(), 0)) == "HTTP/1.1 413 Content Too Large",
+        "an oversized request is 413");
+
+  const std::string ok = ask(p, post("/save", "ssid=Ward+7&password=abcd1234"));
+  check(statusLine(ok) == "HTTP/1.1 200 OK" && store.has, "a corrected submission then saves");
+}
+
+static void testPortalStoreFailure() {
+  printf("\nWi-Fi provisioning: \"saved\" only after the write reads back\n");
+  MemWifiStore store;
+  store.failSave = true;
+  WifiPortal p(&store, "presence-000002", 600000);
+  p.begin(0, kOrigin);
+  const std::string r = ask(p, post("/save", "ssid=net&password=12345678"));
+  check(statusLine(r) == "HTTP/1.1 500 Internal Server Error" && contains(r, "could not store"),
+        "a failed NVS write is reported, not confirmed");
+  check(p.state() == PortalState::Open && p.tick(10'000) == PortalAction::None,
+        "and the portal stays open rather than restarting");
+  check(!contains(r, "12345678"), "the failure page does not echo the password");
+
+  MemWifiStore liar;
+  liar.corruptOnLoad = true;
+  WifiPortal q(&liar, "presence-000003", 600000);
+  q.begin(0, kOrigin);
+  const std::string r2 = ask(q, post("/save", "ssid=net&password=12345678"));
+  check(statusLine(r2) == "HTTP/1.1 500 Internal Server Error" && q.state() == PortalState::Open,
+        "a write that does not read back the same is a failure too");
+}
+
+static void testPortalTimeout() {
+  printf("\nWi-Fi provisioning: the window is bounded\n");
+  MemWifiStore store;
+  WifiPortal p(&store, "presence-000004", 600000);
+  p.begin(5000, kOrigin);
+  check(p.tick(604'999) == PortalAction::None, "open until the window has passed");
+  check(p.tick(605'000) == PortalAction::Close, "closed at the timeout");
+  check(p.state() == PortalState::Closed && p.tick(700'000) == PortalAction::None, "Close is reported once");
+  const std::string late = ask(p, post("/save", "ssid=net&password=12345678"), 606'000);
+  check(statusLine(late) == "HTTP/1.1 503 Service Unavailable" && !store.has,
+        "a submission after the window is refused and stores nothing");
+
+  WifiPortal w(&store, "presence-000005", 600000);
+  w.begin(0xFFFF0000u, kOrigin);  // millis() is about to wrap
+  check(w.tick(0x00010000u) == PortalAction::None, "the window survives a millis() wrap");
+  check(w.tick(0xFFFF0000u + 600000u) == PortalAction::Close, "and still closes on time across it");
+
+  WifiPortal idle(&store, "presence-000006", 600000);
+  check(idle.tick(10'000'000) == PortalAction::None, "a portal never begun never closes or restarts");
+  check(statusLine(ask(idle, get("/"))) == "HTTP/1.1 503 Service Unavailable", "and serves nothing");
+}
+
+static void testPasswordNeverLogged() {
+  printf("\nWi-Fi provisioning: the password never reaches a log line\n");
+  WifiCredentials c;
+  makeCredentials("hospital", "Very-Secret-1", &c);
+  const std::string d = describeWifi(c);
+  check(d == "\"hospital\" (WPA2, passphrase)", "describeWifi names the network and the security");
+  check(!contains(d, "Very-Secret-1") && !contains(d, "13"), "but not the password, nor its length");
+  makeCredentials("open-cafe", "", &c);
+  check(describeWifi(c) == "\"open-cafe\" (open network)", "an open network says so");
+  makeCredentials("psk", std::string(64, 'f'), &c);
+  check(describeWifi(c) == "\"psk\" (WPA2, raw key)" && !contains(describeWifi(c), "ffff"),
+        "a raw key is described, not printed");
+
+  std::string s = "hunter22";
+  secureZero(&s);
+  check(s.empty(), "secureZero empties a string");
+}
+
+static void testSoftApSsid() {
+  printf("\nWi-Fi provisioning: device-unique setup network name\n");
+  const uint8_t a[6] = {0x24, 0x6F, 0x28, 0xA1, 0xB2, 0xC3};
+  const uint8_t b[6] = {0x24, 0x6F, 0x28, 0xA1, 0xB2, 0xC4};
+  check(softApSsid(a) == "presence-A1B2C3", "the SSID is presence- plus the last three MAC bytes");
+  check(softApSsid(a) != softApSsid(b), "two terminals side by side get different names");
+  check(softApSsid(a).size() <= kWifiSsidMaxBytes, "and the name fits in an SSID");
+}
+
+static void testWifiResetTrigger() {
+  printf("\nWi-Fi provisioning: the BOOT-button reset\n");
+  HoldTrigger t(10'000);
+  check(!t.update(true, 0) && !t.update(true, 20'000), "a button held since boot never fires (stuck button)");
+  check(!t.update(false, 20'050), "released: now armed");
+  check(!t.update(true, 21'000), "pressed");
+  check(!t.update(true, 30'999), "not yet at 9.999 s");
+  check(t.update(true, 31'000), "fires at 10 s");
+  check(!t.update(true, 45'000), "only once per hold");
+  check(!t.update(false, 45'050) && !t.update(true, 46'000), "release and press again");
+  check(!t.update(false, 50'000) && !t.update(true, 50'050) && !t.update(true, 60'049),
+        "a release part-way through restarts the count");
+  check(t.update(true, 60'050), "a full second hold fires again");
+
+  HoldTrigger w(10'000);
+  w.update(false, 0xFFFFF000u);
+  w.update(true, 0xFFFFF000u);
+  check(!w.update(true, 0x00001000u), "the hold survives a millis() wrap");
+  check(w.update(true, 0xFFFFF000u + 10'000u), "and fires on time across it");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -1814,6 +2252,19 @@ int main() {
   testConfirmCancelsTheDeadline();
   testDeadlineRestartAfterMarkValidKeepsTheImage();
   testUnarmableTimerFallsBackToTick();
+  testWifiFieldValidation();
+  testWifiCredentialRecord();
+  testWifiBootDecision();
+  testWifiFormParsing();
+  testHttpRequestParsing();
+  testPortalServesNothingElse();
+  testPortalSaveFlow();
+  testPortalRejectsBadInput();
+  testPortalStoreFailure();
+  testPortalTimeout();
+  testPasswordNeverLogged();
+  testSoftApSsid();
+  testWifiResetTrigger();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;
