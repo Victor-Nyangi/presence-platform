@@ -36,6 +36,12 @@
 //     the image) ──► record pending in NVS ──► set boot ──► reboot
 //     Any failure leaves the boot partition alone, so the running image stays.
 //
+//   Wi-Fi (net task): no usable credentials in NVS ──► SoftAP setup portal
+//     "presence-XXXXXX" ──► form saved + read back ──► restart into station
+//     mode. Nothing saved within the window ──► AP down, offline until a
+//     power cycle. Holding BOOT for 10 s erases the credentials and restarts
+//     into the portal. See wifi_provision.h and docs/wifi-provisioning.md.
+//
 //   After the reboot the new image is PENDING_VERIFY. The first successful
 //   heartbeat marks it valid and raises the version floor; no heartbeat within
 //   the confirm window, a crash or a power cut reboots it unconfirmed and the
@@ -66,6 +72,8 @@
 #include "ota_pubkey.h"
 #include "ota_verify.h"
 #include "ring_buffer.h"
+#include "wifi_provision.h"
+#include "wifi_softap.h"
 
 // The version, as a marker `fwsign sign` finds in the image and compares with
 // its -version flag. The signed version is what the terminal trusts, so a
@@ -91,6 +99,10 @@ constexpr int kFingerprintTX = 17;
 constexpr int kBuzzerPin = 25;
 constexpr int kLedGreenPin = 26;
 constexpr int kLedRedPin = 27;
+// The DevKit's BOOT button. A strapping pin: held at power-on it enters the
+// ROM download mode, so the Wi-Fi reset is a hold AFTER boot.
+constexpr int kBootButtonPin = 0;
+constexpr uint32_t kWifiResetHoldMs = 10'000;
 
 // --- protocol tuning (overridden by server config) -------------------
 constexpr uint32_t kHeartbeatMs = 60'000;
@@ -116,6 +128,12 @@ const char* kApiBase = "https://api.example.com";
 // ten minutes is several attempts. The bench env shortens it.
 #ifndef PRESENCE_OTA_CONFIRM_MS
 #define PRESENCE_OTA_CONFIRM_MS 600000
+#endif
+
+// How long the Wi-Fi setup network stays up when nothing is saved. An open
+// AP is the weak point of the whole setup, so it is not left up forever.
+#ifndef PRESENCE_WIFI_PORTAL_MS
+#define PRESENCE_WIFI_PORTAL_MS 600000
 #endif
 
 enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
@@ -148,6 +166,13 @@ bool g_firmwareAvailable = false;
 // Transport failures are not recorded here; those are worth retrying.
 uint8_t g_otaRejectedSha[presence::kSha256Bytes] = {};
 bool g_otaRejected = false;
+
+// Wi-Fi provisioning. g_wifiPortal is decided once in setup(): no usable
+// credentials means the net task runs the setup portal instead of the
+// network loop. Scanning is not affected either way.
+presence::NvsWifiCredentialStore g_wifiStore(&g_nvs);
+presence::HoldTrigger g_wifiReset(kWifiResetHoldMs);
+bool g_wifiPortal = false;
 
 // OtaGuard's two bindings. The decisions are in ota_guard.h, under host test.
 class NvsOtaStateStore : public presence::OtaStateStore {
@@ -877,7 +902,46 @@ void netSleep(uint32_t ms) {
   }
 }
 
+void otaTickFromPortal() {
+  OtaLock lock;
+  g_otaGuard.tick(millis());
+}
+
+// runWifiSetup serves the setup portal on the net task. It restarts the
+// terminal when credentials are saved; if the window closes unused it
+// returns, and the terminal stays offline (still keeping the OTA deadline)
+// until it is power-cycled or BOOT is held.
+[[noreturn]] void runWifiSetup() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  presence::WifiPortal portal(&g_wifiStore, presence::softApSsid(mac), PRESENCE_WIFI_PORTAL_MS);
+  Serial.printf("Wi-Fi: no credentials stored; setup network \"%s\" is open for %u s\n", portal.apSsid().c_str(),
+                static_cast<unsigned>(portal.timeoutMs() / 1000));
+  presence::runSoftApPortal(portal, otaTickFromPortal);
+  Serial.println("Wi-Fi: setup closed with nothing saved; power-cycle, or hold BOOT 10 s, to reopen it");
+  for (;;) {
+    otaTickFromPortal();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// pollWifiReset: BOOT held for 10 s forgets the network and restarts into
+// the setup portal. Only the Wi-Fi entry goes: the punch buffer, sequence
+// counter, device secret and OTA floor all stay, so nothing buffered is lost.
+void pollWifiReset() {
+  if (!g_wifiReset.update(digitalRead(kBootButtonPin) == LOW, millis())) return;
+  Serial.println("Wi-Fi: BOOT held 10 s, forgetting the network and restarting into setup");
+  if (!g_wifiStore.erase()) {
+    Serial.println("Wi-Fi: could not erase the stored credentials; not restarting");
+    return;
+  }
+  Serial.flush();
+  vTaskDelay(pdMS_TO_TICKS(200));
+  esp_restart();
+}
+
 void netTask(void*) {
+  if (g_wifiPortal) runWifiSetup();
   uint32_t lastHeartbeat = 0, lastFlush = 0;
   for (;;) {
     // Before the Wi-Fi check on purpose: an image that cannot bring up Wi-Fi
@@ -1008,6 +1072,20 @@ void setup() {
     Serial.println("WARNING: the OTA release key is a small-order point; over-the-air updates are disabled");
   }
 
+  // Wi-Fi: join the stored network, or leave it to the net task to run the
+  // setup portal. Either way the scan loop below starts the same.
+  pinMode(kBootButtonPin, INPUT_PULLUP);
+  {
+    presence::WifiCredentials creds;
+    if (presence::loadUsableCredentials(&g_wifiStore, &creds)) {
+      Serial.printf("Wi-Fi: joining %s\n", presence::describeWifi(creds).c_str());
+      presence::startStation(creds);
+    } else {
+      g_wifiPortal = true;
+    }
+    presence::secureZero(&creds, sizeof(creds));
+  }
+
   if (!g_nvs.isKey("device_secret")) {
     g_state = State::Provision;
   } else {
@@ -1021,10 +1099,9 @@ void setup() {
 }
 
 void loop() {
+  pollWifiReset();
 #ifdef PRESENCE_BENCH_SERIAL_OTA
   benchSerialOta();
-  vTaskDelay(pdMS_TO_TICKS(50));
-#else
-  vTaskDelay(pdMS_TO_TICKS(1000));
 #endif
+  vTaskDelay(pdMS_TO_TICKS(50));
 }
