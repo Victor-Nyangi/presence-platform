@@ -28,6 +28,7 @@
 #include "../src/ota_verify.h"
 #include "../src/provision.h"
 #include "../src/ring_buffer.h"
+#include "../src/terminal_state.h"
 #include "../src/wifi_provision.h"
 #include "rfc8032_vectors.h"
 
@@ -2576,6 +2577,115 @@ static void testProvisionExchange() {
   }
 }
 
+// ---------------------------------------------------------------------
+// The terminal's state (terminal_state.h). On main before this, setup()
+// ASSIGNED the state line by line -- a sensor FAULT was then overwritten by
+// PROVISION or TIME_SYNC -- and nothing ever set READY, so the scan loop
+// never ran. These walk setup()'s own order of checks.
+// ---------------------------------------------------------------------
+static void bootLikeSetup(TerminalStatus* t, bool sensorOk, bool bufferOk, bool secretInNvs) {
+  t->beginSelfTest();
+  t->setSensorOk(sensorOk);      // g_finger.verifyPassword()
+  t->setBufferOpened(bufferOk);  // storage + ring begin()
+  t->setProvisioned(secretInNvs);
+  t->selfTestDone();
+}
+
+static TerminalState bootState(bool sensorOk, bool bufferOk, bool secretInNvs) {
+  TerminalStatus t;
+  bootLikeSetup(&t, sensorOk, bufferOk, secretInNvs);
+  return t.state();
+}
+
+static void testFaultWinsOverSetupStates() {
+  printf("\nTerminal state: a fault found in setup() is not overwritten\n");
+  check(bootState(false, true, false) == TerminalState::Fault,
+        "sensor down, no secret: FAULT, not PROVISION");
+  check(bootState(false, true, true) == TerminalState::Fault, "sensor down, secret stored: FAULT, not TIME_SYNC");
+  check(bootState(true, false, false) == TerminalState::Fault, "buffer unusable, no secret: FAULT");
+  check(bootState(true, false, true) == TerminalState::Fault, "buffer unusable, secret stored: FAULT");
+
+  TerminalStatus t;  // any order of facts gives the same answer
+  t.beginSelfTest();
+  t.setProvisioned(true);
+  t.setBufferOpened(true);
+  t.setSensorOk(false);
+  t.selfTestDone();
+  check(t.state() == TerminalState::Fault, "whatever order the checks run in");
+  t.setProvisioned(true);
+  check(t.state() == TerminalState::Fault, "and provisioning later does not clear it");
+}
+
+static void testHealthyTerminalReachesReady() {
+  printf("\nTerminal state: READY is reached\n");
+  TerminalStatus fresh;
+  check(fresh.state() == TerminalState::Boot, "before setup(): BOOT");
+  fresh.beginSelfTest();
+  fresh.setSensorOk(true);
+  fresh.setBufferOpened(true);
+  fresh.setProvisioned(true);
+  check(fresh.state() == TerminalState::SelfTest, "during setup(): SELFTEST, even when every check has passed");
+
+  check(bootState(true, true, true) == TerminalState::Ready,
+        "sensor, buffer and secret all good: READY, so the scan loop runs");
+
+  TerminalStatus t;
+  bootLikeSetup(&t, true, true, false);
+  check(t.state() == TerminalState::Provision, "no device secret: PROVISION");
+  t.setProvisioned(true);  // /provision answered and the secret is stored
+  check(t.state() == TerminalState::Ready, "then READY once the secret is stored");
+  // There is no clock input at all: a dead RTC and no network still punch
+  // (uptime_only, SPEC §4), so time sync never holds READY.
+}
+
+static void testSensorLossAndRecovery() {
+  printf("\nTerminal state: losing the sensor, and getting it back\n");
+  TerminalStatus t;
+  bootLikeSetup(&t, true, true, true);
+  for (int i = 0; i < kSensorLostAfter - 1; i++) check(!t.noteSensorCommError(), "a few comm errors are noise");
+  check(t.state() == TerminalState::Ready, "still READY after 4 in a row");
+  t.noteSensorReplied();
+  for (int i = 0; i < kSensorLostAfter - 1; i++) t.noteSensorCommError();
+  check(t.state() == TerminalState::Ready, "a good reply restarts the count");
+  check(t.noteSensorCommError(), "the 5th in a row marks the sensor lost, reported once");
+  check(t.state() == TerminalState::Fault && !t.sensorOk(), "and the terminal is in FAULT");
+  check(!t.noteSensorCommError(), "further errors do not report it again");
+
+  const uint32_t want[] = {2'000, 4'000, 8'000, 16'000, 32'000, 60'000, 60'000};
+  bool backoff = true;
+  for (uint32_t w : want) {
+    backoff = backoff && t.sensorProbeDelayMs() == w;
+    t.noteSensorProbe(false);
+  }
+  check(backoff, "failed probes back off 2 s, 4 s, ... capped at 60 s");
+  for (int i = 0; i < 40; i++) t.noteSensorProbe(false);
+  check(t.sensorProbeDelayMs() == 60'000 && t.state() == TerminalState::Fault, "and stay capped however many fail");
+  t.noteSensorProbe(true);
+  check(t.state() == TerminalState::Ready && t.sensorProbeDelayMs() == 2'000,
+        "one good probe returns it to READY and resets the backoff");
+
+  TerminalStatus u;
+  bootLikeSetup(&u, false, true, false);
+  u.noteSensorProbe(true);
+  check(u.state() == TerminalState::Provision, "a sensor that recovers on an unprovisioned terminal goes to PROVISION");
+}
+
+static void testBufferFaultIsLatched() {
+  printf("\nTerminal state: a failed punch write is latched\n");
+  TerminalStatus t;
+  bootLikeSetup(&t, true, true, true);
+  t.noteBufferWriteFailed();
+  check(t.state() == TerminalState::Fault && !t.bufferOk(), "a failed buffer write is FAULT");
+  t.setBufferOpened(true);
+  t.noteSensorProbe(true);
+  t.setProvisioned(true);
+  check(t.state() == TerminalState::Fault, "and nothing short of a reboot clears it");
+  check(t.provisioned(), "the net task still sees whether it is provisioned (it can still upload)");
+  check(strcmp(terminalStateName(TerminalState::Ready), "READY") == 0 &&
+            strcmp(terminalStateName(TerminalState::Fault), "FAULT") == 0,
+        "states have the SPEC's names on the console");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -2653,6 +2763,10 @@ int main() {
   testProvisionTokenRecord();
   testPortalTokenField();
   testProvisionExchange();
+  testFaultWinsOverSetupStates();
+  testHealthyTerminalReachesReady();
+  testSensorLossAndRecovery();
+  testBufferFaultIsLatched();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;

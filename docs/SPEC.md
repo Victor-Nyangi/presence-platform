@@ -201,6 +201,8 @@ Two FreeRTOS tasks. **The scan loop never blocks on the network** — this is th
      FAULT  ──► sensor/flash error; audible alert, retry with backoff
 ```
 
+**The state is computed, not assigned** (`firmware/src/terminal_state.h`): FAULT when the sensor is not answering or the buffer is unusable — it wins over every other state — else PROVISION without a device secret, else READY. TIME_SYNC does not hold READY: a terminal with a dead RTC and no network must still take punches (§4, `uptime_only`), and the clock is corrected whenever the gateway answers. FAULT retries the sensor with backoff (2 s doubling to 60 s); a failed buffer write stays FAULT until reboot, because a ring that failed a write is not safe to append to again.
+
 **Task 1 — scan loop (core 1, never blocks):**
 `READY → CAPTURE → LOCAL_MATCH → BUFFER_WRITE → FEEDBACK → READY`
 
