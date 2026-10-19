@@ -80,6 +80,11 @@ builds, same toolchain. **Free in the OTA slot now: 891,267 B (45.3%)**, `esp32d
 839,499 B (42.7%); under the 2 × `0x180000` scheme 498,051 B (31.7%), under `default.csv`
 235,907 B (18.0%).
 
+**Computed terminal state (2026-10-19, later)**: `terminal_state.h`, the sensor re-probe and
+the state log line added 1,080 B of flash and no static RAM to `esp32dev` (app 1,075,893 B, 54.7%;
+`firmware.bin` 1,082,464 B). `esp32dev-debug`: app 1,128,077 B, `firmware.bin` 1,134,656 B. Zero
+warnings, clean builds. Free in the OTA slot: 890,187 B (45.3%).
+
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack

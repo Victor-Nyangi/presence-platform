@@ -82,6 +82,7 @@
 #include "ota_verify.h"
 #include "provision.h"
 #include "ring_buffer.h"
+#include "terminal_state.h"
 #include "wifi_provision.h"
 #include "wifi_softap.h"
 
@@ -155,9 +156,11 @@ const char* kApiBase = "https://api.example.com";
 #define PRESENCE_WIFI_FALLBACK_MS 300000
 #endif
 
-enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
-
-State g_state = State::Boot;
+// The terminal's state is computed from its health (terminal_state.h), never
+// assigned, so a fault found early in setup() cannot be overwritten by a
+// milder state later, and READY is reached as soon as nothing blocks it.
+using State = presence::TerminalState;
+presence::TerminalStatus g_terminal;
 uint32_t g_backoffMs = kBackoffMinMs;
 Preferences g_nvs;
 RTC_DS3231 g_rtc;
@@ -383,13 +386,46 @@ int signedGet(const char* path, const String& query, String* response) {
 // Task 1: scan loop. Core 1. No network calls anywhere in this path.
 // --------------------------------------------------------------------
 void scanTask(void*) {
+  State shown = State::Boot;
+  uint32_t lastProbeMs = millis();
   for (;;) {
-    if (g_state != State::Ready) {
+    const State st = g_terminal.state();
+    if (st != shown) {
+      // Every transition is on the console: the bench's first question about
+      // a silent terminal is which state it is in.
+      Serial.printf("state: %s\n", presence::terminalStateName(st));
+      shown = st;
+    }
+
+    // FAULT retries with backoff (SPEC §5). The scan task owns Serial2, so
+    // it is the only one that talks to the sensor, probes included.
+    if (!g_terminal.sensorOk()) {
+      if (millis() - lastProbeMs >= g_terminal.sensorProbeDelayMs()) {
+        const bool ok = g_finger.verifyPassword();
+        g_terminal.noteSensorProbe(ok);
+        lastProbeMs = millis();
+        if (ok) Serial.println("sensor: answering again");
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    if (st != State::Ready) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
 
-    if (g_finger.getImage() != FINGERPRINT_OK) {
+    const uint8_t image = g_finger.getImage();
+    if (image == FINGERPRINT_PACKETRECIEVEERR) {
+      // No reply, or a garbled one. Enough of them in a row is a lost sensor.
+      if (g_terminal.noteSensorCommError()) {
+        Serial.println("FAULT: fingerprint sensor stopped answering; re-probing with backoff");
+        lastProbeMs = millis();
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    g_terminal.noteSensorReplied();
+    if (image != FINGERPRINT_OK) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
@@ -432,7 +468,10 @@ void scanTask(void*) {
     const uint8_t verdict = persisted ? 1 : 2;
     xQueueSend(g_feedbackQueue, &verdict, 0);
 
-    if (!persisted) g_state = State::Fault;
+    if (!persisted) {
+      g_terminal.noteBufferWriteFailed();  // latched: never beep green on a dropped punch
+      Serial.println("FAULT: punch buffer write failed");
+    }
     vTaskDelay(pdMS_TO_TICKS(800));
   }
 }
@@ -521,7 +560,10 @@ bool sendHeartbeat() {
   body += ",\"free_heap\":";
   body += presence::jsonInt(static_cast<int64_t>(ESP.getFreeHeap()));
   body += ",\"sensor_ok\":";
-  body += g_finger.verifyPassword() ? "true" : "false";
+  // From the scan task's view of the sensor, not a probe from here: Serial2
+  // belongs to the scan task, and two tasks talking to the sensor at once
+  // garble each other's packets.
+  body += g_terminal.sensorOk() ? "true" : "false";
   body += ",\"rtc_ok\":";
   body += g_rtcTrusted ? "true" : "false";
   body += "}";
@@ -1086,7 +1128,7 @@ bool provisionDevice() {
   }
   memcpy(g_secret, r.secret, sizeof(g_secret));
   g_tokenStore.erase();
-  g_state = State::TimeSync;
+  g_terminal.setProvisioned(true);
   Serial.printf("Provision: provisioned as device %s, key version %d\n", r.deviceId.c_str(),
                 static_cast<int>(r.keyVersion));
   return true;
@@ -1134,7 +1176,7 @@ void netTask(void*) {
 
     // No device secret yet: nothing can be signed until the token has been
     // exchanged for one, so that is the only call worth making.
-    if (g_state == State::Provision) {
+    if (!g_terminal.provisioned()) {
       const bool provisioned = provisionDevice();
       provisioned ? resetBackoff() : growBackoff();
       netSleep(provisioned ? 1000 : g_backoffMs);
@@ -1231,7 +1273,7 @@ void setup() {
   const esp_partition_t* running = esp_ota_get_running_partition();
   Serial.printf("presence terminal %s, running from %s\n", kFirmwareVersion, running ? running->label : "?");
 
-  g_state = State::SelfTest;
+  g_terminal.beginSelfTest();
   LittleFS.begin(true);
   g_nvs.begin("presence", false);
   g_seq = g_nvs.getULong64("seq", 0);
@@ -1263,7 +1305,8 @@ void setup() {
   Serial.printf("OTA: version floor %s\n", presence::formatOtaVersion(g_otaGuard.floor()).c_str());
 
   Serial2.begin(57600, SERIAL_8N1, kFingerprintRX, kFingerprintTX);
-  if (!g_finger.verifyPassword()) g_state = State::Fault;
+  g_terminal.setSensorOk(g_finger.verifyPassword());
+  if (!g_terminal.sensorOk()) Serial.println("FAULT: fingerprint sensor not answering; re-probing with backoff");
 
   // A dead RTC is not fatal. Events are stamped with uptime instead and the
   // gateway reconstructs wall time from the delta at upload, flagging them
@@ -1281,9 +1324,10 @@ void setup() {
   // would look healthy and silently drop every punch taken offline.
   g_storage = new presence::LittleFsStorage(&g_nvs);
   g_buffer = new presence::RingBuffer(g_storage);
-  if (!g_storage->begin() || !g_buffer->begin()) {
+  const bool bufferOpened = g_storage->begin() && g_buffer->begin();
+  g_terminal.setBufferOpened(bufferOpened);
+  if (!bufferOpened) {
     Serial.println("FAULT: punch buffer unavailable");
-    g_state = State::Fault;
   } else {
     // Printed because the capacity is computed from whatever the LittleFS
     // partition actually has. This line is the authoritative answer to how
@@ -1317,15 +1361,21 @@ void setup() {
     presence::secureZero(&creds, sizeof(creds));
   }
 
+  // Provisioned or not, a fault found above still wins: the state is
+  // computed from all of these, not set by whichever line ran last.
   if (!g_nvs.isKey("device_secret")) {
-    g_state = State::Provision;
+    g_terminal.setProvisioned(false);
   } else {
     g_nvs.getBytes("device_secret", g_secret, sizeof(g_secret));
-    g_state = State::TimeSync;
+    g_terminal.setProvisioned(true);
     // A power cut between storing the secret and erasing the token leaves a
     // spent bearer token in NVS. It has no further use.
     g_tokenStore.erase();
   }
+
+  // Self-test is over. From here the state follows the facts above and
+  // whatever the tasks learn: READY once nothing blocks it.
+  g_terminal.selfTestDone();  // the scan task prints the resulting state
 
   xTaskCreatePinnedToCore(scanTask, "scan", 8192, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(feedbackTask, "feedback", 4096, nullptr, 1, nullptr, 1);
