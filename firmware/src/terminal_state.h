@@ -9,8 +9,9 @@
 //   no device secret ....................................... PROVISION
 //   otherwise ............................................... READY
 //
-// SPEC §5: BOOT → SELFTEST → [secret in NVS?] → PROVISION → TIME_SYNC → READY,
-// BUFFER_WRITE fail → FAULT, and FAULT "retry with backoff" back to READY.
+// SPEC §5 drew BOOT → SELFTEST → [secret in NVS?] → PROVISION → TIME_SYNC →
+// READY, and FAULT "retry with backoff" back to READY. The two departures
+// below were accepted as made on 2026-10-19, and §5 now draws them.
 //
 // TIME_SYNC does not gate READY. §4 requires a terminal with a dead RTC and no
 // network to keep taking punches (stamped uptime_only, reconstructed by the

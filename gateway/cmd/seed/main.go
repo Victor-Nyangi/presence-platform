@@ -281,6 +281,10 @@ func report(dsn, mode string, secret []byte) {
 
 	fmt.Printf("\nDEVICE_SECRET  %s\n", hex.EncodeToString(secret))
 	fmt.Printf("key_version    1\n")
+	fmt.Printf("fingerprint    %s\n", cryptobox.SecretFingerprint(secret))
+	fmt.Printf("\nOn a bench terminal (esp32dev-debug), send over USB serial:\n")
+	fmt.Printf("  BENCH-SECRET %s <DEVICE_SECRET>\n", deviceID)
+	fmt.Printf("It answers with the same fingerprint (README, \"Getting a device onto the bench\").\n")
 	fmt.Printf("\nThe secret is not stored in recoverable form anywhere else — the row holds\n")
 	fmt.Printf("only ciphertext. Re-run with -reset to issue a new one.\n")
 }
