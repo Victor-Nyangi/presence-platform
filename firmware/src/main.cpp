@@ -36,11 +36,20 @@
 //     the image) ──► record pending in NVS ──► set boot ──► reboot
 //     Any failure leaves the boot partition alone, so the running image stays.
 //
-//   Wi-Fi (net task): no usable credentials in NVS ──► SoftAP setup portal
-//     "presence-XXXXXX" ──► form saved + read back ──► restart into station
-//     mode. Nothing saved within the window ──► AP down, offline until a
-//     power cycle. Holding BOOT for 10 s erases the credentials and restarts
-//     into the portal. See wifi_provision.h and docs/wifi-provisioning.md.
+//   Wi-Fi (net task): no usable credentials in NVS ──► WPA2 SoftAP setup
+//     portal "presence-XXXXXX", password on the label ──► form saved + read
+//     back ──► restart into station mode. Nothing saved within the window ──►
+//     AP down, offline until a power cycle. Saved network not joined within
+//     5 min of boot ──► the same portal for one window, credentials kept ──►
+//     back to the saved network, alternating until one works. No setup key in
+//     NVS ──► no setup network at all. Holding BOOT for 10 s erases the
+//     credentials and restarts into the portal. See wifi_provision.h and
+//     docs/wifi-provisioning.md.
+//
+//   PROVISION (net task, once on Wi-Fi): no device secret ──► POST
+//     /v1/device/provision with the token from the setup page ──► store
+//     device_id, key_version, then device_secret ──► erase the token. A
+//     refused token is erased; anything else retries. See provision.h.
 //
 //   After the reboot the new image is PENDING_VERIFY. The first successful
 //   heartbeat marks it valid and raises the version floor; no heartbeat within
@@ -71,6 +80,7 @@
 #include "ota_guard.h"
 #include "ota_pubkey.h"
 #include "ota_verify.h"
+#include "provision.h"
 #include "ring_buffer.h"
 #include "wifi_provision.h"
 #include "wifi_softap.h"
@@ -130,10 +140,19 @@ const char* kApiBase = "https://api.example.com";
 #define PRESENCE_OTA_CONFIRM_MS 600000
 #endif
 
-// How long the Wi-Fi setup network stays up when nothing is saved. An open
-// AP is the weak point of the whole setup, so it is not left up forever.
+// How long the Wi-Fi setup network stays up when nothing is saved. It is
+// WPA2 with a per-device password, but a setup AP is still the weak point of
+// the whole setup, so it is not left up forever.
 #ifndef PRESENCE_WIFI_PORTAL_MS
 #define PRESENCE_WIFI_PORTAL_MS 600000
+#endif
+
+// How long a terminal with saved credentials tries to join that network
+// after boot before it reopens the setup portal (keeping the credentials).
+// A router takes a few minutes to come back after a power cut that also
+// restarted the terminal; five is past that. The bench env shortens it.
+#ifndef PRESENCE_WIFI_FALLBACK_MS
+#define PRESENCE_WIFI_FALLBACK_MS 300000
 #endif
 
 enum class State { Boot, SelfTest, Provision, TimeSync, Ready, Enroll, Ota, Fault };
@@ -171,8 +190,12 @@ bool g_otaRejected = false;
 // credentials means the net task runs the setup portal instead of the
 // network loop. Scanning is not affected either way.
 presence::NvsWifiCredentialStore g_wifiStore(&g_nvs);
+presence::NvsSetupKeyStore g_setupKeyStore(&g_nvs);
+presence::NvsProvisionTokenStore g_tokenStore(&g_nvs);
 presence::HoldTrigger g_wifiReset(kWifiResetHoldMs);
+presence::StationFallback g_wifiFallback(PRESENCE_WIFI_FALLBACK_MS);
 bool g_wifiPortal = false;
+bool g_noTokenReported = false;
 
 // OtaGuard's two bindings. The decisions are in ota_guard.h, under host test.
 class NvsOtaStateStore : public presence::OtaStateStore {
@@ -826,10 +849,8 @@ void benchStatus(const char* tag) {
                 st.hasBad ? presence::toHex(st.badSha, 4).c_str() : "-");
 }
 
-void benchSerialOta() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
+// benchSerialOta handles one line serialCommands() has already read.
+void benchSerialOta(const String& line) {
   if (line == "OTA STATUS") {
     benchStatus("STATUS");
     return;
@@ -907,22 +928,168 @@ void otaTickFromPortal() {
   g_otaGuard.tick(millis());
 }
 
-// runWifiSetup serves the setup portal on the net task. It restarts the
-// terminal when credentials are saved; if the window closes unused it
-// returns, and the terminal stays offline (still keeping the OTA deadline)
-// until it is power-cycled or BOOT is held.
-[[noreturn]] void runWifiSetup() {
+presence::TokenField tokenFieldMode() {
+  if (g_nvs.isKey("device_secret")) return presence::TokenField::Hidden;
+  presence::ProvisionTokenRecord tok;
+  const bool have = presence::loadUsableToken(&g_tokenStore, &tok);
+  presence::secureZero(&tok, sizeof(tok));
+  return have ? presence::TokenField::Optional : presence::TokenField::Required;
+}
+
+bool haveSetupKey() {
+  presence::SetupApKey key;
+  const bool have = presence::loadUsableSetupKey(&g_setupKeyStore, &key);
+  presence::secureZero(&key, sizeof(key));
+  return have;
+}
+
+// runSetupPortal opens the WPA2 setup network for one window. It restarts
+// the terminal when something is saved, and returns when the window closes
+// unused. false: no setup key is stored, so there was no setup network.
+bool runSetupPortal(const char* why) {
+  presence::SetupApKey key;
+  if (!presence::loadUsableSetupKey(&g_setupKeyStore, &key)) return false;
   uint8_t mac[6];
   WiFi.macAddress(mac);
   presence::WifiPortal portal(&g_wifiStore, presence::softApSsid(mac), PRESENCE_WIFI_PORTAL_MS);
-  Serial.printf("Wi-Fi: no credentials stored; setup network \"%s\" is open for %u s\n", portal.apSsid().c_str(),
-                static_cast<unsigned>(portal.timeoutMs() / 1000));
-  presence::runSoftApPortal(portal, otaTickFromPortal);
+  portal.setTokenField(&g_tokenStore, tokenFieldMode());
+  Serial.printf("Wi-Fi: %s; setup network \"%s\" (WPA2, password on the label) is up for %u s\n", why,
+                portal.apSsid().c_str(), static_cast<unsigned>(portal.timeoutMs() / 1000));
+  presence::runSoftApPortal(portal, key, otaTickFromPortal);
+  presence::secureZero(&key, sizeof(key));
+  return true;
+}
+
+// runWifiSetup: first boot, or after the BOOT-button reset. With no setup
+// key there is no setup network -- never an open one -- so it waits for
+// setup_label.py to store one over USB. If the window closes unused the
+// terminal stays offline (still keeping the OTA deadline) until it is
+// power-cycled or BOOT is held: with no saved network there is nothing to
+// fall back to.
+[[noreturn]] void runWifiSetup() {
+  if (!haveSetupKey()) {
+    Serial.println("Wi-Fi: no setup key stored, so there is no setup network. Label this terminal over USB with "
+                   "firmware/tools/setup_label.py (docs/wifi-provisioning.md)");
+    while (!haveSetupKey()) {
+      otaTickFromPortal();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    Serial.println("Wi-Fi: setup key stored");
+  }
+  runSetupPortal("no Wi-Fi credentials stored");
   Serial.println("Wi-Fi: setup closed with nothing saved; power-cycle, or hold BOOT 10 s, to reopen it");
   for (;;) {
     otaTickFromPortal();
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
+}
+
+// rejoinSavedNetwork restarts the station on the stored credentials, after
+// the fall-back portal closed unused.
+void rejoinSavedNetwork() {
+  presence::WifiCredentials creds;
+  if (presence::loadUsableCredentials(&g_wifiStore, &creds)) {
+    Serial.printf("Wi-Fi: back to %s\n", presence::describeWifi(creds).c_str());
+    presence::startStation(creds);
+  } else {
+    Serial.println("Wi-Fi: the saved network is gone; restarting into setup");
+    Serial.flush();
+    esp_restart();
+  }
+  presence::secureZero(&creds, sizeof(creds));
+}
+
+// fallBackToPortal: the saved network has not been joined since boot within
+// the window. Open the setup network for one window (nothing is erased; a
+// save restarts into the new network), then go back to the saved one with
+// a fresh window. wifi_provision.h's StationFallback has the reasoning.
+void fallBackToPortal() {
+  char why[96];
+  snprintf(why, sizeof(why), "could not join the saved network within %u s of boot",
+           static_cast<unsigned>(g_wifiFallback.windowMs() / 1000));
+  if (runSetupPortal(why)) {
+    rejoinSavedNetwork();
+  } else {
+    Serial.printf("Wi-Fi: %s, and no setup key is stored, so no setup network; still retrying\n", why);
+  }
+  g_wifiFallback.restart(millis());
+  resetBackoff();
+}
+
+// storeDeviceIdentity writes what /provision returned. device_secret goes
+// last and is read back: its presence is the boot decision, so it is the
+// commit, and device_id/key_version must already be there when it lands.
+bool storeDeviceIdentity(const presence::ProvisionResult& r) {
+  if (g_nvs.putString("device_id", r.deviceId.c_str()) != r.deviceId.size()) return false;
+  if (g_nvs.putInt("key_version", static_cast<int32_t>(r.keyVersion)) == 0) return false;
+  if (g_nvs.putBytes("device_secret", r.secret, sizeof(r.secret)) != sizeof(r.secret)) return false;
+  uint8_t back[presence::kDeviceSecretBytes];
+  const bool ok = g_nvs.getBytes("device_secret", back, sizeof(back)) == sizeof(back) &&
+                  memcmp(back, r.secret, sizeof(back)) == 0;
+  presence::secureZero(back, sizeof(back));
+  return ok;
+}
+
+// provisionDevice exchanges the stored token for a device secret (SPEC §3,
+// openapi.yaml). Unauthenticated by HMAC -- there is no secret yet -- so the
+// token is the credential. Until the gateway implements the endpoint it
+// answers 501, which is retried like any other transient failure.
+bool provisionDevice() {
+  presence::ProvisionTokenRecord tok;
+  if (!presence::loadUsableToken(&g_tokenStore, &tok)) {
+    if (!g_noTokenReported) {
+      Serial.println("Provision: no device secret and no provisioning token; hold BOOT 10 s and enter the token "
+                     "on the setup page");
+      g_noTokenReported = true;
+    }
+    return false;
+  }
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  const std::string body = presence::buildProvisionBody(presence::deviceSerial(mac), kFirmwareVersion);
+
+  HTTPClient http;
+  http.begin(String(kApiBase) + "/v1/device/provision");
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Provision-Token", tok.token);
+  presence::secureZero(&tok, sizeof(tok));
+  const int code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.data())), body.size());
+  String resp = http.getString();
+  http.end();
+
+  switch (presence::classifyProvisionStatus(code)) {
+    case presence::ProvisionStatus::Refused:
+      // 401/403/409: retrying cannot help, and a consumed token is useless.
+      g_tokenStore.erase();
+      Serial.printf("Provision: the gateway refused the token (HTTP %d), so it was forgotten; hold BOOT 10 s and "
+                    "enter a new one\n", code);
+      presence::secureZero(resp.begin(), resp.length());
+      return false;
+    case presence::ProvisionStatus::Retry:
+      log_w("Provision: HTTP %d, will retry", code);
+      presence::secureZero(resp.begin(), resp.length());
+      return false;
+    case presence::ProvisionStatus::Ok:
+      break;
+  }
+  presence::ProvisionResult r;
+  const bool parsed = presence::parseProvisionResponse(resp.c_str(), &r);
+  presence::secureZero(resp.begin(), resp.length());
+  if (!parsed) {
+    Serial.println("Provision: malformed response from the gateway; nothing stored");
+    return false;
+  }
+  if (!storeDeviceIdentity(r)) {
+    Serial.println("Provision: could not store the device secret in NVS");
+    return false;
+  }
+  memcpy(g_secret, r.secret, sizeof(g_secret));
+  g_tokenStore.erase();
+  g_state = State::TimeSync;
+  Serial.printf("Provision: provisioned as device %s, key version %d\n", r.deviceId.c_str(),
+                static_cast<int>(r.keyVersion));
+  return true;
 }
 
 // pollWifiReset: BOOT held for 10 s forgets the network and restarts into
@@ -942,6 +1109,7 @@ void pollWifiReset() {
 
 void netTask(void*) {
   if (g_wifiPortal) runWifiSetup();
+  g_wifiFallback.begin(millis());
   uint32_t lastHeartbeat = 0, lastFlush = 0;
   for (;;) {
     // Before the Wi-Fi check on purpose: an image that cannot bring up Wi-Fi
@@ -950,11 +1118,26 @@ void netTask(void*) {
       OtaLock lock;
       g_otaGuard.tick(millis());  // reboots into the previous slot when the window has passed
     }
-    if (WiFi.status() != WL_CONNECTED) {
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    if (g_wifiFallback.portalDue(connected, millis())) {
+      fallBackToPortal();
+      continue;
+    }
+    if (!connected) {
       // Scanning continues regardless; this is the whole point of the buffer.
       WiFi.reconnect();
-      netSleep(g_backoffMs);
+      // Never sleep past the fall-back deadline, however long the backoff.
+      netSleep(std::max<uint32_t>(1000, std::min(g_backoffMs, g_wifiFallback.msUntilDue(millis()))));
       growBackoff();
+      continue;
+    }
+
+    // No device secret yet: nothing can be signed until the token has been
+    // exchanged for one, so that is the only call worth making.
+    if (g_state == State::Provision) {
+      const bool provisioned = provisionDevice();
+      provisioned ? resetBackoff() : growBackoff();
+      netSleep(provisioned ? 1000 : g_backoffMs);
       continue;
     }
 
@@ -981,6 +1164,54 @@ void netTask(void*) {
     ok ? resetBackoff() : growBackoff();
     netSleep(ok ? 1000 : g_backoffMs);
   }
+}
+
+// handleSetupKey stores the setup network's password from setup_label.py.
+// It never prints it back.
+void handleSetupKey(const std::string& key) {
+  presence::SetupApKey rec;
+  if (!presence::makeSetupKey(key, &rec)) {
+    Serial.println("SETUP-KEY REJECT not a setup key (xxxx-xxxx-xxxx-xxxx)");
+    return;
+  }
+  bool ok = g_setupKeyStore.save(rec);
+  if (ok) {
+    presence::SetupApKey back;
+    ok = g_setupKeyStore.load(&back) && memcmp(&back, &rec, sizeof(rec)) == 0;
+    presence::secureZero(&back, sizeof(back));
+  }
+  presence::secureZero(&rec, sizeof(rec));
+  Serial.println(ok ? "SETUP-KEY OK" : "SETUP-KEY REJECT could not store it in NVS");
+}
+
+// serialCommands: one line from USB serial per call. SETUP-* in every build
+// (manufacture labelling); OTA * only in the bench build.
+void serialCommands() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  std::string key;
+  switch (presence::parseSetupCommand(line.c_str(), line.length(), &key)) {
+    case presence::SetupCommand::Id: {
+      uint8_t mac[6];
+      WiFi.macAddress(mac);
+      Serial.println(presence::setupIdLine(mac, haveSetupKey()).c_str());
+      break;
+    }
+    case presence::SetupCommand::SetKey:
+      handleSetupKey(key);
+      break;
+    case presence::SetupCommand::Malformed:
+      Serial.println("SETUP REJECT unknown command");
+      break;
+    case presence::SetupCommand::None:
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+      benchSerialOta(line);
+#endif
+      break;
+  }
+  presence::secureZero(&key);
+  presence::secureZero(line.begin(), line.length());
 }
 
 }  // namespace
@@ -1091,6 +1322,9 @@ void setup() {
   } else {
     g_nvs.getBytes("device_secret", g_secret, sizeof(g_secret));
     g_state = State::TimeSync;
+    // A power cut between storing the secret and erasing the token leaves a
+    // spent bearer token in NVS. It has no further use.
+    g_tokenStore.erase();
   }
 
   xTaskCreatePinnedToCore(scanTask, "scan", 8192, nullptr, 2, nullptr, 1);
@@ -1100,8 +1334,6 @@ void setup() {
 
 void loop() {
   pollWifiReset();
-#ifdef PRESENCE_BENCH_SERIAL_OTA
-  benchSerialOta();
-#endif
+  serialCommands();
   vTaskDelay(pdMS_TO_TICKS(50));
 }
