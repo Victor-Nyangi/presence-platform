@@ -149,7 +149,9 @@ CREATE TABLE device (
     prev_key_version    integer,
     secret_rotated_at   timestamptz,
 
-    -- One-time provisioning token (hashed), consumed on first contact.
+    -- One-time provisioning token, consumed on first contact. Peppered
+    -- SHA-256 over the token's 32 decoded bytes, not its hex text
+    -- (cryptobox.HashProvisionToken; decided 2026-10-19).
     provision_token_hash bytea,
     provisioned_at      timestamptz,
 

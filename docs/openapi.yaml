@@ -457,6 +457,10 @@ components:
       type: apiKey
       in: header
       name: X-Provision-Token
+      description: |
+        The one-time token, as 64 hex digits (32 bytes). The server stores
+        and compares a peppered SHA-256 of the 32 decoded bytes, not of the
+        hex text, so either case is the same token.
 
   schemas:
 

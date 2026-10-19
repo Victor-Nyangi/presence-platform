@@ -104,7 +104,7 @@ mTLS is stronger, but client-cert provisioning and rotation on ESP32 is a genuin
 
 **Rotation** — `device.key_version` plus `prev_secret_enc` means the server accepts vN and vN+1 simultaneously until the device successfully uses the new key. No downtime, no bricked terminal in a school 200km away.
 
-**Secrets are encrypted, not hashed.** Verifying an HMAC requires the server to hold the raw key, so hashing it would make it unverifiable — a mistake worth naming, because "hash all secrets" is the correct reflex almost everywhere else. Device secrets are sealed with AES-256-GCM under a KEK held outside the database, with the device id as additional authenticated data so a row cannot be lifted from one device and pasted into another. Bearer values the client presents verbatim — the one-time provisioning token — *are* hashed.
+**Secrets are encrypted, not hashed.** Verifying an HMAC requires the server to hold the raw key, so hashing it would make it unverifiable — a mistake worth naming, because "hash all secrets" is the correct reflex almost everywhere else. Device secrets are sealed with AES-256-GCM under a KEK held outside the database, with the device id as additional authenticated data so a row cannot be lifted from one device and pasted into another. Bearer values the client presents verbatim — the one-time provisioning token — *are* hashed: `provision_token_hash` is a peppered SHA-256 over the token's **32 decoded bytes, not its 64-character hex text** (decided 2026-10-19; `cryptobox.HashProvisionToken`), so one token has one digest whatever case it was typed in.
 
 **The clock chicken-and-egg** — signing needs a roughly-correct clock, but the device's clock is exactly what might be broken. Resolution: `GET /v1/device/time` is unauthenticated and rate-limited. If a signed request arrives outside the ±300s window, the server returns `401 clock_skew` *with `server_time_ms` in the body*, and the device corrects and retries once. `(device_id, nonce)` is cached for the skew window to block replays.
 
@@ -159,28 +159,30 @@ The signature is pure Ed25519 over a short preamble carrying the version and siz
 Two FreeRTOS tasks. **The scan loop never blocks on the network** — this is the whole design.
 
 ```
-                  ┌──────────────────────────────────────┐
-   BOOT ──► SELFTEST ──► [secret in NVS?] ──no──► PROVISION ──┐
-                  │            │yes                            │
-                  │            ▼                               │
-                  │        TIME_SYNC ◄─────────────────────────┘
-                  │            │
-                  │            ▼
-                  └──────►   READY  ◄──────────────┐
-                            │  ▲                    │
-                 finger/card│  │                    │
-                            ▼  │                    │
-                         CAPTURE                    │
-                            │                       │
-                            ▼                       │
-                       LOCAL_MATCH                  │
-                            │                       │
-                            ▼                       │
-                      BUFFER_WRITE ──fail──► FAULT ─┘
-                            │
-                            ▼
-                        FEEDBACK ────────────────────┘
-                     (beep + LED + name)
+   BOOT ──► SELFTEST ──► [secret in NVS?] ──no──► PROVISION
+               │               │ yes                  │ secret stored
+               │               ▼                      │
+               │      ┌────► READY ◄──────────────────┘
+               │      │        │ finger/card
+               │      │        ▼
+               │      │     CAPTURE
+               │      │        ▼
+               │      │   LOCAL_MATCH
+               │      │        ▼
+               │      │  BUFFER_WRITE ──fail──► FAULT, latched until reboot
+               │      │        ▼
+               │      └─── FEEDBACK
+               │      (beep + LED + name)
+               │
+               └──► FAULT: sensor not answering (at boot, or 5 errors in a row
+                    later), or the punch buffer will not open. FAULT wins over
+                    every other state. Sensor: re-probed with backoff (2 s
+                    doubling to 60 s), one good probe ──► READY. Buffer: latched
+                    until reboot.
+
+   No TIME_SYNC gate: the net task corrects the clock whenever the gateway
+   answers, and READY takes punches meanwhile (uptime_only, §4). That, and
+   the buffer fault latching until reboot, were decided 2026-10-19.
 
    Network task, before anything else:
      [Wi-Fi credentials in NVS?] ──no──► WIFI_SETUP (WPA2 SoftAP captive portal,
@@ -193,15 +195,18 @@ Two FreeRTOS tasks. **The scan loop never blocks on the network** — this is th
      BOOT held 10 s ──► erase Wi-Fi credentials only ──► reboot into WIFI_SETUP
      on Wi-Fi, no secret (PROVISION) ──► POST /provision with the token from
          the setup page ──► store the secret ──► erase the token
+     bench build only: BENCH-SECRET over USB stores the id + secret `make seed`
+         printed ──► read back, fingerprint printed ──► restart
 
    Side states, entered from READY on command:
      ENROLL ──► capture ×2 ──► store slot ──► upload template ──► READY
      OTA    ──► newer? ──► download ──► verify sha256 + Ed25519 ──► flash ──► reboot
                 ──► first heartbeat confirms it, else roll back to the previous image
-     FAULT  ──► sensor/flash error; audible alert, retry with backoff
+     FAULT  ──► audible alert; a lost sensor is re-probed with backoff, a buffer
+                fault holds until reboot (above)
 ```
 
-**The state is computed, not assigned** (`firmware/src/terminal_state.h`): FAULT when the sensor is not answering or the buffer is unusable — it wins over every other state — else PROVISION without a device secret, else READY. TIME_SYNC does not hold READY: a terminal with a dead RTC and no network must still take punches (§4, `uptime_only`), and the clock is corrected whenever the gateway answers. FAULT retries the sensor with backoff (2 s doubling to 60 s); a failed buffer write stays FAULT until reboot, because a ring that failed a write is not safe to append to again.
+**The state is computed, not assigned** (`firmware/src/terminal_state.h`; the two rules below that #10 implemented were accepted as made on 2026-10-19): FAULT when the sensor is not answering or the buffer is unusable — it wins over every other state — else PROVISION without a device secret, else READY. TIME_SYNC does not hold READY: a terminal with a dead RTC and no network must still take punches (§4, `uptime_only`), and the clock is corrected whenever the gateway answers. FAULT retries the sensor with backoff (2 s doubling to 60 s); a failed buffer write stays FAULT until reboot, because a ring that failed a write is not safe to append to again.
 
 **Task 1 — scan loop (core 1, never blocks):**
 `READY → CAPTURE → LOCAL_MATCH → BUFFER_WRITE → FEEDBACK → READY`
@@ -219,7 +224,7 @@ Never touches the scan loop's state directly; they communicate through the flash
 
 **Capacity is set by the partition table, not the flash size.** `min_spiffs.csv` spends a 4MB part on two 1.875MB OTA app slots and leaves roughly 128KB for the filesystem — on the order of 2,000 events, or about two days for a 500-person site punching twice daily. That clears the bar, but by far less margin than "4MB of flash" suggests. The firmware sizes the ring from whatever the partition actually reports rather than a hard-coded number, so trading app space for filesystem later grows the buffer with no code change; the terminal prints its real record count at boot. Any such trade has to be measured against the OTA rollback budget, since shrinking the app slots below what the firmware needs bricks the build.
 
-**Wi-Fi provisioning (decided 2026-10-18, revised 2026-10-19).** A terminal with no usable Wi-Fi credentials in NVS — first boot, or after BOOT is held for 10 s — opens a WPA2 access point named `presence-` plus the last three bytes of its MAC, whose password is printed on the terminal's label, answers every DNS name with its own address, and serves exactly one form: SSID, password and, on a terminal not yet provisioned, the provisioning token. The label password is derived at manufacture from the MAC and a factory secret that never leaves the factory machine, and only the terminal's own derived value is written to it; a terminal with no such key opens no access point at all, never an open one. A valid submission is written to NVS (token first, credentials last) and read back before the page says "saved"; then the terminal restarts into station mode. The window is bounded (10 minutes): if nothing is saved, the AP goes down and the terminal stays offline until it is power-cycled. A terminal with saved credentials that has not joined that network within 5 minutes of boot reopens the same portal for one window without erasing anything, then retries the saved network, alternating until one works — so a router that comes back restores normal operation, and the two never share the radio. Once the terminal has joined since boot, a later drop is an outage and is only retried. The portal serves nothing else — no OTA, no punch data, no device API — and never logs or echoes the password or token. It runs on the network task, so the scan loop is unaffected. The gateway URL is a build constant, not a portal field, and the reset erases only the Wi-Fi entry, never the buffer, sequence counter, secret, setup key or OTA floor. Once on Wi-Fi, a terminal with no device secret presents the token to `POST /provision` (which the gateway still answers with 501). Design, the factory tool, what the gateway must implement and the bench checklist: [`wifi-provisioning.md`](wifi-provisioning.md).
+**Wi-Fi provisioning (decided 2026-10-18, revised 2026-10-19).** A terminal with no usable Wi-Fi credentials in NVS — first boot, or after BOOT is held for 10 s — opens a WPA2 access point named `presence-` plus the last three bytes of its MAC, whose password is printed on the terminal's label, answers every DNS name with its own address, and serves exactly one form: SSID, password and, on a terminal not yet provisioned, the provisioning token. The label password is derived at manufacture from the MAC and a factory secret that never leaves the factory machine, and only the terminal's own derived value is written to it; a terminal with no such key opens no access point at all, never an open one. A valid submission is written to NVS (token first, credentials last) and read back before the page says "saved"; then the terminal restarts into station mode. The window is bounded (10 minutes): if nothing is saved, the AP goes down and the terminal stays offline until it is power-cycled. A terminal with saved credentials that has not joined that network within 5 minutes of boot reopens the same portal for one window without erasing anything, then retries the saved network, alternating until one works — so a router that comes back restores normal operation, and the two never share the radio. Once the terminal has joined since boot, a later drop is an outage and is only retried. The portal serves nothing else — no OTA, no punch data, no device API — and never logs or echoes the password or token. It runs on the network task, so the scan loop is unaffected. The gateway URL is a build constant, not a portal field, and the reset erases only the Wi-Fi entry, never the buffer, sequence counter, secret, setup key or OTA floor. Once on Wi-Fi, a terminal with no device secret presents the token to `POST /provision` (which the gateway still answers with 501; on the bench, the debug build's `BENCH-SECRET` serial command loads a `make seed` secret instead). Design, the factory tool, what the gateway must implement and the bench checklist: [`wifi-provisioning.md`](wifi-provisioning.md).
 
 **Sequence counter:** in NVS, `commit → then use`. If power drops between commit and use you burn a number, which is harmless. The reverse order would reuse one, which silently destroys idempotency.
 

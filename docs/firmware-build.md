@@ -85,6 +85,12 @@ the state log line added 1,080 B of flash and no static RAM to `esp32dev` (app 1
 `firmware.bin` 1,082,464 B). `esp32dev-debug`: app 1,128,077 B, `firmware.bin` 1,134,656 B. Zero
 warnings, clean builds. Free in the OTA slot: 890,187 B (45.3%).
 
+**Bench `BENCH-SECRET` command (2026-10-19, later)**, compiled into `esp32dev-debug` only:
+`esp32dev` is **unchanged**, app 1,075,893 B and `firmware.bin` 1,082,464 B, the same as before
+it, and `tools/check_bench_only.py` finds no `BENCH-SECRET` in that image.
+`esp32dev-debug`: app 1,131,493 B (+3,416 B), `firmware.bin` 1,138,064 B. Static RAM unchanged
+(48,052 B). Zero warnings, clean builds, same toolchain.
+
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack
