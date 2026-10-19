@@ -2,6 +2,9 @@ package cryptobox
 
 import (
 	"bytes"
+	"encoding/hex"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -128,6 +131,67 @@ func TestTokenHashing(t *testing.T) {
 	}
 	if EqualToken(HashToken([]byte("p2"), []byte("token")), a) {
 		t.Error("the pepper must affect the digest")
+	}
+}
+
+// The provisioning token is hashed as its 32 decoded bytes, not its hex text
+// (decided 2026-10-19). The digest is pinned so a later "simplification" to
+// HashToken(pepper, []byte(header)) fails here rather than at every install.
+func TestHashProvisionTokenHashesTheDecodedBytes(t *testing.T) {
+	pepper := []byte("pepper")
+	const tokenHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	raw, _ := hex.DecodeString(tokenHex)
+
+	got, err := HashProvisionToken(pepper, tokenHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// sha256("pepper" || 00 01 .. 1f)
+	const golden = "08cfaaf62bf7a451cf0c91b3b6e40c5d4c0960c0c4361b260835fb1a825de0f8"
+	if hex.EncodeToString(got) != golden {
+		t.Fatalf("digest = %x, want %s", got, golden)
+	}
+	if !EqualToken(got, HashToken(pepper, raw)) {
+		t.Error("should equal HashToken over the decoded bytes")
+	}
+	if EqualToken(got, HashToken(pepper, []byte(tokenHex))) {
+		t.Error("must not equal HashToken over the hex text")
+	}
+
+	upper, err := HashProvisionToken(pepper, strings.ToUpper(tokenHex))
+	if err != nil || !EqualToken(upper, got) {
+		t.Error("upper-case hex is the same token and must hash the same")
+	}
+
+	for _, bad := range []string{
+		"",
+		tokenHex[:63],
+		tokenHex[:62],
+		tokenHex + "00",
+		tokenHex[:62] + "zz",
+		" " + tokenHex[:63],
+		"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", // base64 of the same bytes
+	} {
+		if _, err := HashProvisionToken(pepper, bad); !errors.Is(err, ErrTokenFormat) {
+			t.Errorf("HashProvisionToken(%q) err = %v, want ErrTokenFormat", bad, err)
+		}
+	}
+}
+
+// The same golden vector is in firmware/test/host_test.cpp
+// (benchSecretFingerprint), so seed's printout and the terminal's
+// BENCH-SECRET OK line agree.
+func TestSecretFingerprintGoldenVector(t *testing.T) {
+	secret := make([]byte, 32)
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	if got := SecretFingerprint(secret); got != "3d94eea4" {
+		t.Fatalf("fingerprint = %s, want 3d94eea4", got)
+	}
+	secret[31] ^= 1
+	if SecretFingerprint(secret) == "3d94eea4" {
+		t.Error("a flipped bit must change the fingerprint")
 	}
 }
 

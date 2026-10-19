@@ -16,6 +16,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -95,6 +96,44 @@ func HashToken(pepper, token []byte) []byte {
 	h.Write(pepper)
 	h.Write(token)
 	return h.Sum(nil)
+}
+
+// ProvisionTokenBytes is the length of a provisioning token: 32 bytes of
+// CSPRNG output, carried on the wire (X-Provision-Token) and on the label as
+// 64 hex digits.
+const ProvisionTokenBytes = 32
+
+// ErrTokenFormat is returned for a provisioning token that is not exactly 64
+// hex digits.
+var ErrTokenFormat = errors.New("cryptobox: provisioning token is not 64 hex digits")
+
+// HashProvisionToken hashes a provisioning token as presented in
+// X-Provision-Token. It hashes the 32 DECODED bytes, not the hex text
+// (decided 2026-10-19, docs/wifi-provisioning.md): one token has one digest
+// whether it was typed in upper or lower case, and the stored hash is a
+// function of the secret itself, not of how it happened to be spelled.
+// Issuing a token (storing provision_token_hash) and exchanging one at POST
+// /v1/device/provision must both go through this function, never through
+// HashToken on the header text, or no token will ever match.
+func HashProvisionToken(pepper []byte, tokenHex string) ([]byte, error) {
+	if len(tokenHex) != 2*ProvisionTokenBytes {
+		return nil, ErrTokenFormat
+	}
+	raw, err := hex.DecodeString(tokenHex)
+	if err != nil {
+		return nil, ErrTokenFormat
+	}
+	defer clear(raw)
+	return HashToken(pepper, raw), nil
+}
+
+// SecretFingerprint is the first 4 bytes of SHA-512 over a device secret, as
+// 8 lower-case hex digits: enough to check by eye that a bench terminal holds
+// the secret seed issued (the firmware's BENCH-SECRET prints the same value;
+// one golden vector pins both), nowhere near enough to recover it.
+func SecretFingerprint(secret []byte) string {
+	sum := sha512.Sum512(secret)
+	return hex.EncodeToString(sum[:4])
 }
 
 // EqualToken compares in constant time.

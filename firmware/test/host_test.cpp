@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/bench_secret.h"
 #include "../src/canonical.h"
 #include "../src/events_json.h"
 #include "../src/ota_guard.h"
@@ -2686,6 +2687,82 @@ static void testBufferFaultIsLatched() {
         "states have the SPEC's names on the console");
 }
 
+// The bench-only BENCH-SECRET command (bench_secret.h). Only the parser and
+// the fingerprint are portable; the NVS write is storeDeviceIdentity(), and
+// check_bench_only.py keeps the command out of the release build.
+static constexpr const char* kBenchDeviceId = "55555555-5555-5555-5555-555555555555";  // make seed's device
+static constexpr const char* kBenchSecretHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+static void testBenchSecretCommand() {
+  printf("\nBench: BENCH-SECRET loads a make-seed device secret into NVS\n");
+  ProvisionResult r;
+  auto parse = [&r](const std::string& line) { return parseBenchSecretCommand(line.data(), line.size(), &r); };
+  const std::string id = kBenchDeviceId, hex = kBenchSecretHex;
+  uint8_t want[32];
+  for (int i = 0; i < 32; i++) want[i] = static_cast<uint8_t>(i);
+
+  check(parse("BENCH-SECRET " + id + " " + hex) == BenchSecretParse::Ok && r.deviceId == id && r.keyVersion == 1 &&
+            memcmp(r.secret, want, 32) == 0,
+        "device id + 64-hex secret parse, key_version defaults to 1 (what make seed issues)");
+  check(parse("BENCH-SECRET " + id + " " + hex + " 7") == BenchSecretParse::Ok && r.keyVersion == 7,
+        "an explicit key_version is kept");
+  std::string upper = hex;
+  for (auto& c : upper) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+  check(parse("BENCH-SECRET 55555555-5555-5555-5555-AAAAAAAAAAAA  " + upper + "  ") == BenchSecretParse::Ok &&
+            r.deviceId == "55555555-5555-5555-5555-aaaaaaaaaaaa" && memcmp(r.secret, want, 32) == 0,
+        "either case, repeated spaces; the id is stored lower-cased");
+
+  auto refused = [&](const std::string& line, BenchSecretParse want_, const char* name) {
+    memset(r.secret, 0xAA, sizeof(r.secret));
+    const BenchSecretParse got = parse(line);
+    bool zero = true;
+    for (uint8_t b : r.secret) zero = zero && b == 0;
+    check(got == want_ && zero && r.deviceId.empty(), name, "got " + std::to_string(static_cast<int>(got)));
+  };
+  refused("BENCH-SECRET", BenchSecretParse::MissingFields, "no arguments is refused, with the usage");
+  refused("BENCH-SECRET " + id, BenchSecretParse::MissingFields, "a device id with no secret is refused");
+  refused("BENCH-SECRET " + id + " " + hex + " 1 x", BenchSecretParse::ExtraFields, "trailing junk is refused, not ignored");
+  refused("BENCH-SECRET 55555555-5555-5555-5555-55555555555 " + hex, BenchSecretParse::BadDeviceId, "a short UUID is refused");
+  refused("BENCH-SECRET 55555555x5555-5555-5555-555555555555 " + hex, BenchSecretParse::BadDeviceId, "a UUID without its dashes is refused");
+  refused("BENCH-SECRET " + id + " " + hex.substr(0, 63), BenchSecretParse::BadSecretLength, "63 hex digits are refused");
+  refused("BENCH-SECRET " + id + " " + hex + "0", BenchSecretParse::BadSecretLength, "65 hex digits are refused");
+  refused("BENCH-SECRET " + id + " " + hex.substr(0, 62) + "zz", BenchSecretParse::BadSecretHex, "a non-hex secret is refused");
+  refused("BENCH-SECRET " + id + " AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", BenchSecretParse::BadSecretLength,
+          "the base64 form is refused (make seed prints hex)");
+  for (const char* kv : {"0", "-1", "+1", "01", "2147483648", "99999999999", "1.0", "x"}) {
+    refused("BENCH-SECRET " + id + " " + hex + " " + kv, BenchSecretParse::BadKeyVersion,
+            (std::string("key_version ") + kv + " is refused").c_str());
+  }
+  check(parse("BENCH-SECRET " + id + " " + hex + " 2147483647") == BenchSecretParse::Ok && r.keyVersion == INT32_MAX,
+        "key_version up to INT32_MAX (NVS stores an int32)");
+
+  check(parse("OTA STATUS") == BenchSecretParse::NotOurs && parse("SETUP-ID") == BenchSecretParse::NotOurs &&
+            parse("BENCH-SECRETS " + id + " " + hex) == BenchSecretParse::NotOurs && parse("") == BenchSecretParse::NotOurs,
+        "other lines are left to the other commands");
+
+  // No reason text may carry the input, whatever it was.
+  bool leak = false;
+  for (int p = 0; p <= static_cast<int>(BenchSecretParse::BadKeyVersion); p++) {
+    const std::string t = benchSecretParseText(static_cast<BenchSecretParse>(p));
+    leak = leak || t.find("0001020304") != std::string::npos || t.find("5555") != std::string::npos;
+  }
+  check(!leak, "no rejection reason contains the secret or the id");
+
+  // The fingerprint: first 4 bytes of SHA-512 over the raw secret. The same
+  // vector is in gateway/internal/cryptobox (SecretFingerprint, which make seed
+  // prints), so the two sides cannot drift.
+  check(benchSecretFingerprint(want) == "3d94eea4", "fingerprint golden vector (shared with the gateway)",
+        benchSecretFingerprint(want));
+  uint8_t other[32];
+  memcpy(other, want, 32);
+  other[31] ^= 1;
+  check(benchSecretFingerprint(other) != benchSecretFingerprint(want), "one flipped bit changes the fingerprint");
+  const std::string ok = benchSecretOkLine(id, 1, want);
+  check(ok == "BENCH-SECRET OK device=" + id + " key_version=1 fingerprint=3d94eea4", "the OK line", ok);
+  check(ok.find(hex) == std::string::npos && ok.find(hex.substr(0, 16)) == std::string::npos,
+        "the OK line never carries the secret");
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -2767,6 +2844,7 @@ int main() {
   testHealthyTerminalReachesReady();
   testSensorLossAndRecovery();
   testBufferFaultIsLatched();
+  testBenchSecretCommand();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;

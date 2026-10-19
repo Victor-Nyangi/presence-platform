@@ -12,23 +12,30 @@
 // buffering and feedback happen on core 1 with no network calls anywhere in
 // the path; core 0 drains the buffer whenever it can.
 //
-//                  ┌──────────────────────────────────────┐
-//   BOOT ──► SELFTEST ──► [secret in NVS?] ──no──► PROVISION ──┐
-//                  │            │yes                            │
-//                  │            ▼                               │
-//                  │        TIME_SYNC ◄─────────────────────────┘
-//                  │            │
-//                  └──────►   READY  ◄──────────────┐
-//                            │  ▲                    │
-//                 finger/card│  │                    │
-//                            ▼  │                    │
-//                         CAPTURE                    │
-//                            ▼                       │
-//                       LOCAL_MATCH                  │
-//                            ▼                       │
-//                      BUFFER_WRITE ──fail──► FAULT ─┘
-//                            ▼
-//                        FEEDBACK ────────────────────┘
+//   BOOT ──► SELFTEST ──► [secret in NVS?] ──no──► PROVISION
+//               │               │ yes                  │ secret stored
+//               │               ▼                      │
+//               │      ┌────► READY ◄──────────────────┘
+//               │      │        │ finger/card
+//               │      │        ▼
+//               │      │     CAPTURE
+//               │      │        ▼
+//               │      │   LOCAL_MATCH
+//               │      │        ▼
+//               │      │  BUFFER_WRITE ──fail──► FAULT, latched until reboot
+//               │      │        ▼
+//               │      └─── FEEDBACK
+//               │      (beep + LED + name)
+//               │
+//               └──► FAULT: sensor not answering (at boot, or 5 errors in a row
+//                    later), or the punch buffer will not open. FAULT wins over
+//                    every other state. Sensor: re-probed with backoff (2 s
+//                    doubling to 60 s), one good probe ──► READY. Buffer: latched
+//                    until reboot.
+//
+//   No TIME_SYNC gate: the net task corrects the clock whenever the gateway
+//   answers, and READY takes punches meanwhile (uptime_only, §4). That, and
+//   the buffer fault latching until reboot, were decided 2026-10-19.
 //
 //   OTA (net task, scanning continues throughout):
 //     manifest ──► newer than running AND floor? ──► download to the idle slot
@@ -85,6 +92,9 @@
 #include "terminal_state.h"
 #include "wifi_provision.h"
 #include "wifi_softap.h"
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+#include "bench_secret.h"
+#endif
 
 // The version, as a marker `fwsign sign` finds in the image and compares with
 // its -version flag. The signed version is what the terminal trusts, so a
@@ -1208,6 +1218,52 @@ void netTask(void*) {
   }
 }
 
+#ifdef PRESENCE_BENCH_SERIAL_OTA
+// Bench-only BENCH-SECRET: load the device id and secret `make seed` printed,
+// because /provision is still a 501 and a terminal without a secret never
+// leaves PROVISION. Same NVS keys and order as storeDeviceIdentity(), read
+// back, and only a fingerprint printed. bench_secret.h has the protocol;
+// tools/check_bench_only.py keeps it out of the release build.
+//
+// Returns false when the line is not a BENCH-SECRET command.
+bool benchSecretCommand(const String& line) {
+  presence::ProvisionResult r;
+  const presence::BenchSecretParse p = presence::parseBenchSecretCommand(line.c_str(), line.length(), &r);
+  if (p == presence::BenchSecretParse::NotOurs) return false;
+  if (p != presence::BenchSecretParse::Ok) {
+    Serial.printf("BENCH-SECRET REJECT %s\n", presence::benchSecretParseText(p));
+    return true;
+  }
+  // Drop any old secret first, so a write that fails partway leaves an
+  // unprovisioned terminal rather than a new device_id beside the old secret.
+  if (g_nvs.isKey("device_secret") && !g_nvs.remove("device_secret")) {
+    Serial.println("BENCH-SECRET REJECT could not clear the old secret in NVS");
+    return true;
+  }
+  bool ok = storeDeviceIdentity(r);
+  uint8_t back[presence::kDeviceSecretBytes] = {};
+  ok = ok && g_nvs.getString("device_id", "") == r.deviceId.c_str() &&
+       g_nvs.getInt("key_version", 0) == static_cast<int32_t>(r.keyVersion) &&
+       g_nvs.getBytes("device_secret", back, sizeof(back)) == sizeof(back) &&
+       memcmp(back, r.secret, sizeof(back)) == 0;
+  if (!ok) {
+    presence::secureZero(back, sizeof(back));
+    g_nvs.remove("device_secret");  // never leave a half-written identity looking provisioned
+    Serial.println("BENCH-SECRET REJECT could not store it in NVS");
+    return true;
+  }
+  Serial.println(presence::benchSecretOkLine(r.deviceId, r.keyVersion, back).c_str());
+  presence::secureZero(back, sizeof(back));
+  // Restart rather than swap g_secret under the net task, which may be signing
+  // with the old one. Boot loads the new secret and erases a leftover token.
+  Serial.println("BENCH-SECRET restarting to load it");
+  Serial.flush();
+  vTaskDelay(pdMS_TO_TICKS(200));
+  esp_restart();
+  return true;
+}
+#endif
+
 // handleSetupKey stores the setup network's password from setup_label.py.
 // It never prints it back.
 void handleSetupKey(const std::string& key) {
@@ -1227,7 +1283,7 @@ void handleSetupKey(const std::string& key) {
 }
 
 // serialCommands: one line from USB serial per call. SETUP-* in every build
-// (manufacture labelling); OTA * only in the bench build.
+// (manufacture labelling); BENCH-SECRET and OTA * only in the bench build.
 void serialCommands() {
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n');
@@ -1248,7 +1304,7 @@ void serialCommands() {
       break;
     case presence::SetupCommand::None:
 #ifdef PRESENCE_BENCH_SERIAL_OTA
-      benchSerialOta(line);
+      if (!benchSecretCommand(line)) benchSerialOta(line);
 #endif
       break;
   }

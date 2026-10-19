@@ -35,6 +35,8 @@ firmware-test: ## Compile and run firmware logic tests on the host
 	@./.build/fwtest
 	@# The setup-label derivation's golden vector (stdlib only, no pyserial).
 	python3 -I firmware/tools/setup_label.py self-test
+	@# BENCH-SECRET is compiled into esp32dev-debug only (bench_secret.h).
+	python3 -I firmware/tools/check_bench_only.py
 
 build: ## Build the gateway, recompute, seed, deliver and fwsign binaries
 	cd gateway && go build -o ../.build/gateway ./cmd/gateway
