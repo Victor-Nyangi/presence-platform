@@ -33,6 +33,8 @@ firmware-test: ## Compile and run firmware logic tests on the host
 		firmware/test/host_test.cpp firmware/src/crc32.cpp \
 		.build/monocypher.o .build/monocypher-ed25519.o
 	@./.build/fwtest
+	@# The setup-label derivation's golden vector (stdlib only, no pyserial).
+	python3 -I firmware/tools/setup_label.py self-test
 
 build: ## Build the gateway, recompute, seed, deliver and fwsign binaries
 	cd gateway && go build -o ../.build/gateway ./cmd/gateway

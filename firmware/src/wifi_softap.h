@@ -2,9 +2,10 @@
 //
 // Like littlefs_storage.h, this cannot compile on the host and is kept thin
 // for that reason: it owns the radio, the sockets and NVS, and nothing else.
-// Every decision -- what is a valid SSID or password, how a request is
-// parsed, which paths exist, when the window closes, when to restart --
-// is in wifi_provision.h under host test.
+// Every decision -- what is a valid SSID, password, token or setup key, how a
+// request is parsed, which paths exist, when the window closes, when to fall
+// back to the portal, when to restart -- is in wifi_provision.h and
+// provision.h under host test.
 //
 // Not the Arduino WebServer: at CORE_DEBUG_LEVEL 5 (esp32dev-debug) it logs
 // every POST body with log_v, which here is the Wi-Fi password.
@@ -33,6 +34,38 @@ class NvsWifiCredentialStore : public WifiCredentialStore {
     return nvs_->getBytes(key_, out, sizeof(*out)) == sizeof(*out);
   }
   bool save(const WifiCredentials& c) override { return nvs_->putBytes(key_, &c, sizeof(c)) == sizeof(c); }
+  bool erase() override { return !nvs_->isKey(key_) || nvs_->remove(key_); }
+
+ private:
+  Preferences* nvs_;
+  const char* key_;
+};
+
+// One NVS entry each, like the credentials. The setup key is written once at
+// manufacture (setup_label.py) and kept by the BOOT-button reset; the token
+// lives only until the gateway has exchanged it for a device secret.
+class NvsSetupKeyStore : public SetupKeyStore {
+ public:
+  explicit NvsSetupKeyStore(Preferences* nvs, const char* key = "ap_key") : nvs_(nvs), key_(key) {}
+  bool load(SetupApKey* out) override {
+    if (!nvs_->isKey(key_) || nvs_->getBytesLength(key_) != sizeof(*out)) return false;
+    return nvs_->getBytes(key_, out, sizeof(*out)) == sizeof(*out);
+  }
+  bool save(const SetupApKey& k) override { return nvs_->putBytes(key_, &k, sizeof(k)) == sizeof(k); }
+
+ private:
+  Preferences* nvs_;
+  const char* key_;
+};
+
+class NvsProvisionTokenStore : public ProvisionTokenStore {
+ public:
+  explicit NvsProvisionTokenStore(Preferences* nvs, const char* key = "prov_token") : nvs_(nvs), key_(key) {}
+  bool load(ProvisionTokenRecord* out) override {
+    if (!nvs_->isKey(key_) || nvs_->getBytesLength(key_) != sizeof(*out)) return false;
+    return nvs_->getBytes(key_, out, sizeof(*out)) == sizeof(*out);
+  }
+  bool save(const ProvisionTokenRecord& r) override { return nvs_->putBytes(key_, &r, sizeof(r)) == sizeof(r); }
   bool erase() override { return !nvs_->isKey(key_) || nvs_->remove(key_); }
 
  private:
@@ -76,14 +109,22 @@ inline void serveOne(WiFiClient& client, WifiPortal& portal) {
 
 // runSoftApPortal opens the setup network and serves it. It does not return
 // once credentials are saved: it restarts into station mode. It returns when
-// the window closes with nothing saved, with the AP and both servers down.
-// idle runs between requests (main.cpp keeps the OTA confirm deadline there).
-inline void runSoftApPortal(WifiPortal& portal, void (*idle)()) {
+// the window closes with nothing saved, with the AP and both servers down
+// and the radio off. idle runs between requests (main.cpp keeps the OTA
+// confirm deadline there). There is no open variant: the caller must hold a
+// usable setup key, and without one there is no setup network.
+inline void runSoftApPortal(WifiPortal& portal, const SetupApKey& key, void (*idle)()) {
+  if (!setupKeyUsable(key)) {
+    Serial.println("Wi-Fi: no usable setup key; the setup network stays off");
+    return;
+  }
   WiFi.persistent(false);
+  WiFi.disconnect(true);  // stop a station still retrying the saved network
   WiFi.mode(WIFI_AP);
-  // Open, channel 1, visible, ONE client: a second phone cannot join while
-  // the installer is using it.
-  if (!WiFi.softAP(portal.apSsid().c_str(), nullptr, 1, 0, 1)) {
+  // WPA2-PSK (the core's default for a non-empty passphrase), channel 1,
+  // visible, ONE client: a second phone cannot join while the installer is
+  // using it. The driver copies the passphrase.
+  if (!WiFi.softAP(portal.apSsid().c_str(), key.key, 1, 0, 1)) {
     Serial.println("Wi-Fi: could not start the setup network");
     WiFi.mode(WIFI_OFF);
     return;

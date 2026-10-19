@@ -8,7 +8,9 @@
 // same Monocypher sources the terminal links are compiled in here. So is the
 // OTA downgrade and rollback state machine (ota_guard.h), against a
 // simulated two-slot flash, bootloader and file-backed NVS. And the Wi-Fi
-// setup portal (wifi_provision.h): everything but the radio and sockets.
+// setup portal (wifi_provision.h): everything but the radio and sockets,
+// including the WPA2 setup key, the fall-back to the portal and the
+// provisioning token, plus the terminal's side of /provision (provision.h).
 
 #include <cassert>
 #include <cstdio>
@@ -24,6 +26,7 @@
 #include "../src/ota_guard.h"
 #include "../src/ota_pubkey.h"
 #include "../src/ota_verify.h"
+#include "../src/provision.h"
 #include "../src/ring_buffer.h"
 #include "../src/wifi_provision.h"
 #include "rfc8032_vectors.h"
@@ -2194,6 +2197,385 @@ static void testWifiResetTrigger() {
   check(w.update(true, 0xFFFFF000u + 10'000u), "and fires on time across it");
 }
 
+
+// ---------------------------------------------------------------------
+// 2026-10-19 follow-up: the WPA2 setup key, the fall-back to the portal,
+// and the provisioning token (wifi_provision.h, provision.h).
+// ---------------------------------------------------------------------
+class MemSetupKeyStore : public SetupKeyStore {
+ public:
+  bool load(SetupApKey* out) override {
+    if (!has) return false;
+    *out = rec;
+    return true;
+  }
+  bool save(const SetupApKey& k) override {
+    rec = k;
+    has = true;
+    return true;
+  }
+  SetupApKey rec{};
+  bool has = false;
+};
+
+class MemTokenStore : public ProvisionTokenStore {
+ public:
+  bool load(ProvisionTokenRecord* out) override {
+    if (!has) return false;
+    *out = rec;
+    if (corruptOnLoad) out->token[0] = out->token[0] == 'a' ? 'b' : 'a';
+    return true;
+  }
+  bool save(const ProvisionTokenRecord& r) override {
+    saves++;
+    if (failSave) return false;
+    rec = r;
+    has = true;
+    return true;
+  }
+  bool erase() override {
+    has = false;
+    memset(&rec, 0, sizeof(rec));
+    return true;
+  }
+  ProvisionTokenRecord rec{};
+  bool has = false;
+  bool failSave = false;
+  bool corruptOnLoad = false;
+  int saves = 0;
+};
+
+// The golden vector from firmware/tools/setup_label.py (derive() with the
+// test key 00..1f and MAC 24:6F:28:A1:B2:C3; `make firmware-test` runs that
+// tool's self-test too). Asserted here only as a key the terminal accepts:
+// the terminal never derives one.
+static const char* kGoldenSetupKey = "usty-qc6e-hs6z-52yd";
+// Test tokens. Not real.
+static const std::string kTokenA(64, 'a');
+static const std::string kTokenMixed = "0123456789ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef";
+
+static void testSetupKeyFormat() {
+  printf("\nWi-Fi setup key: format and record\n");
+  check(validSetupKey(kGoldenSetupKey, strlen(kGoldenSetupKey)), "setup_label.py's golden vector is a valid key");
+  struct Case {
+    const char* key;
+    const char* name;
+  } bad[] = {
+      {"", "an empty key is refused"},
+      {"usty-qc6e-hs6z-52y", "18 characters are refused"},
+      {"usty-qc6e-hs6z-52ydd", "20 characters are refused"},
+      {"USTY-QC6E-HS6Z-52YD", "upper case is refused (WPA2 passwords are case-sensitive; the label is lower case)"},
+      {"usty-qc6e-hs6z-52y0", "0 is not in the alphabet"},
+      {"usty-qc6e-hs6z-52yo", "o is not in the alphabet"},
+      {"usty-qc6e-hs6z-52y1", "1 is not in the alphabet"},
+      {"usty-qc6e-hs6z-52yl", "l is not in the alphabet"},
+      {"ustyqc6e-hs6z-52yd-", "dashes in the wrong place are refused"},
+      {"usty qc6e hs6z 52yd", "spaces instead of dashes are refused"},
+  };
+  for (const Case& c : bad) check(!validSetupKey(c.key, strlen(c.key)), c.name);
+  const char withNul[] = "usty-qc6e\0hs6z-52yd";
+  check(!validSetupKey(withNul, 19), "an embedded NUL is refused");
+
+  SetupApKey k;
+  check(makeSetupKey(kGoldenSetupKey, &k) && setupKeyUsable(k) && strcmp(k.key, kGoldenSetupKey) == 0,
+        "a valid key makes a usable record");
+  check(sizeof(SetupApKey) == 24, "SetupApKey is 24 bytes (a layout change needs a new magic)");
+  SetupApKey z;
+  memset(&z, 0x55, sizeof(z));
+  check(!makeSetupKey("not-a-key", &z) && z.magic == 0 && z.key[0] == '\0', "a refused key leaves the record zeroed");
+  SetupApKey m = k;
+  m.magic ^= 1;
+  check(!setupKeyUsable(m), "a wrong magic is not usable");
+  m = k;
+  m.key[19] = 'x';
+  check(!setupKeyUsable(m), "a missing terminator is not usable");
+
+  MemSetupKeyStore store;
+  SetupApKey out;
+  memset(&out, 0x55, sizeof(out));
+  check(!loadUsableSetupKey(&store, &out) && out.magic == 0, "no key stored: no setup network (and the buffer is zeroed)");
+  check(!loadUsableSetupKey(nullptr, &out), "no store: no setup network");
+  store.rec = k;
+  store.rec.key[3] = 'O';
+  store.has = true;
+  check(!loadUsableSetupKey(&store, &out), "a corrupted stored key is treated as none, never as an open network");
+  store.rec = k;
+  check(loadUsableSetupKey(&store, &out) && strcmp(out.key, kGoldenSetupKey) == 0, "a stored key is loaded");
+  check(validatePassword(out.key, strlen(out.key)) == WifiFieldError::Ok,
+        "the key is also a valid WPA2 passphrase (8..63 printable ASCII)");
+}
+
+static void testSetupSerialCommands() {
+  printf("\nWi-Fi setup key: the USB serial commands\n");
+  std::string key;
+  auto parse = [&key](const char* line) { return parseSetupCommand(line, strlen(line), &key); };
+  check(parse("SETUP-ID") == SetupCommand::Id, "SETUP-ID asks for the identity");
+  check(parse("SETUP-KEY usty-qc6e-hs6z-52yd") == SetupCommand::SetKey && key == kGoldenSetupKey,
+        "SETUP-KEY carries the key");
+  check(parse("SETUP-KEY bogus") == SetupCommand::SetKey && key == "bogus",
+        "a malformed key is still a SETUP-KEY (refused by makeSetupKey, with a reason)");
+  check(parse("SETUP-KEY") == SetupCommand::Malformed && key.empty(), "SETUP-KEY with no key is malformed");
+  check(parse("SETUP-KEY ") == SetupCommand::Malformed, "SETUP-KEY with an empty key is malformed");
+  check(parse("SETUP-IDX") == SetupCommand::Malformed, "an unknown SETUP- command is malformed");
+  check(parse("OTA STATUS") == SetupCommand::None, "OTA lines are left to the bench loader");
+  check(parse("") == SetupCommand::None && parse("SETUP") == SetupCommand::None, "anything else is not ours");
+
+  const uint8_t mac[6] = {0x24, 0x6F, 0x28, 0xA1, 0xB2, 0xC3};
+  check(setupIdLine(mac, true) == "SETUP-ID mac=246F28A1B2C3 ssid=presence-A1B2C3 key=present",
+        "SETUP-ID reports the MAC, the setup SSID and whether a key is stored");
+  check(setupIdLine(mac, false) == "SETUP-ID mac=246F28A1B2C3 ssid=presence-A1B2C3 key=absent",
+        "and says when none is -- never the key itself");
+}
+
+static void testStationFallback() {
+  printf("\nWi-Fi fall-back: the saved network, then the portal, alternating\n");
+  StationFallback f(300'000);
+  check(!f.portalDue(false, 10'000'000) && f.msUntilDue(0) == UINT32_MAX, "never begun: never due");
+  f.begin(1'000);
+  check(!f.portalDue(false, 300'999) && f.msUntilDue(300'000) == 1'000, "not due within 5 minutes of boot");
+  check(f.portalDue(false, 301'000) && f.msUntilDue(301'000) == 0, "due once the saved network has not joined in 5 minutes");
+  check(f.portalDue(false, 302'000), "and stays due until the portal has run (level, not edge)");
+  f.restart(900'000);  // the portal ran its window and closed unused
+  check(!f.portalDue(false, 1'199'999), "after the portal closes, the saved network gets a fresh window");
+  check(f.portalDue(false, 1'200'000), "then the portal comes due again");
+  f.restart(1'800'000);
+  check(!f.portalDue(true, 1'850'000) && f.joined(), "joining the saved network disarms the fall-back");
+  check(!f.portalDue(false, 99'000'000) && f.msUntilDue(99'000'000) == UINT32_MAX,
+        "for good: a later outage is retried, not turned into a setup network");
+
+  StationFallback early(300'000);
+  early.begin(0);
+  check(!early.portalDue(true, 5'000) && !early.portalDue(false, 400'000), "joined quickly after boot: never due");
+
+  StationFallback late(300'000);
+  late.begin(0);
+  check(!late.portalDue(true, 300'000), "connected at the deadline itself: not due");
+
+  StationFallback w(300'000);
+  w.begin(0xFFFF0000u);
+  check(!w.portalDue(false, 0x00010000u), "the window survives a millis() wrap");
+  check(w.portalDue(false, 0xFFFF0000u + 300'000u), "and comes due on time across it");
+}
+
+static void testProvisionTokenRecord() {
+  printf("\nProvisioning token: validation and record\n");
+  ProvisionTokenRecord r;
+  check(makeTokenRecord(kTokenA, &r) == TokenError::Ok && tokenRecordUsable(r) && kTokenA == r.token,
+        "64 hex digits make a usable record");
+  check(makeTokenRecord(kTokenMixed, &r) == TokenError::Ok &&
+            std::string(r.token) == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "upper-case hex is stored lower-cased (the terminal sends it as stored)");
+  check(makeTokenRecord("  " + kTokenA + "\r\n", &r) == TokenError::Ok && kTokenA == r.token,
+        "spaces and line breaks around a pasted token are dropped");
+  check(makeTokenRecord("", &r) == TokenError::Missing, "an empty token is missing");
+  check(makeTokenRecord("   ", &r) == TokenError::Missing, "a blank token is missing");
+  check(makeTokenRecord(std::string(63, 'a'), &r) == TokenError::BadLength, "63 digits are refused");
+  check(makeTokenRecord(std::string(65, 'a'), &r) == TokenError::BadLength, "65 digits are refused");
+  check(makeTokenRecord(std::string(63, 'a') + "g", &r) == TokenError::BadHex, "a non-hex digit is refused");
+  check(makeTokenRecord(std::string(32, 'a') + " " + std::string(31, 'a'), &r) == TokenError::BadHex,
+        "a space inside the token is refused");
+  check(r.magic == 0 && r.token[0] == '\0', "a refused token leaves the record zeroed");
+  check(sizeof(ProvisionTokenRecord) == 69, "ProvisionTokenRecord is 69 bytes (a layout change needs a new magic)");
+
+  makeTokenRecord(kTokenA, &r);
+  ProvisionTokenRecord m = r;
+  m.magic ^= 1;
+  check(!tokenRecordUsable(m), "a wrong magic is not usable");
+  m = r;
+  m.token[5] = 'A';
+  check(!tokenRecordUsable(m), "a stored upper-case digit is not usable (this build never writes one)");
+  m = r;
+  m.token[64] = 'a';
+  check(!tokenRecordUsable(m), "a missing terminator is not usable");
+
+  MemTokenStore store;
+  ProvisionTokenRecord out;
+  memset(&out, 0x55, sizeof(out));
+  check(!loadUsableToken(&store, &out) && out.magic == 0, "no token stored: none, and the buffer is zeroed");
+  store.rec = r;
+  store.has = true;
+  check(loadUsableToken(&store, &out) && kTokenA == out.token, "a stored token is loaded");
+}
+
+static std::string formBody(const std::string& ssid, const std::string& password, const char* token = nullptr) {
+  std::string b = "ssid=" + ssid + "&password=" + password;
+  if (token != nullptr) b += std::string("&token=") + token;
+  return b;
+}
+
+static void testPortalTokenField() {
+  printf("\nProvisioning token: collected by the setup page\n");
+  {
+    MemWifiStore wifi;
+    MemTokenStore tokens;
+    WifiPortal p(&wifi, "presence-00000A", 600000);
+    p.setTokenField(&tokens, TokenField::Hidden);
+    p.begin(0, kOrigin);
+    check(!contains(ask(p, get("/")), "name=\"token\""), "a provisioned terminal's page has no token field");
+    const std::string r = ask(p, post("/save", formBody("net", "12345678", kTokenA.c_str())));
+    check(statusLine(r) == "HTTP/1.1 200 OK" && wifi.has && !tokens.has && tokens.saves == 0,
+          "and a token sent anyway is ignored, not stored");
+  }
+  {
+    MemWifiStore wifi;
+    MemTokenStore tokens;
+    WifiPortal p(&wifi, "presence-00000B", 600000);
+    p.setTokenField(&tokens, TokenField::Required);
+    p.begin(0, kOrigin);
+    const std::string form = ask(p, get("/"));
+    check(contains(form, "name=\"token\" type=\"password\"") && contains(form, "spellcheck=\"false\" required>"),
+          "an unprovisioned terminal's page asks for the token, as a required password-type field");
+
+    const std::string none = ask(p, post("/save", formBody("Ward+7", "12345678")));
+    check(statusLine(none) == "HTTP/1.1 400 Bad Request" && contains(none, "Enter the provisioning token"),
+          "no token is refused with a reason");
+    check(!wifi.has && !tokens.has && p.state() == PortalState::Open,
+          "and nothing is stored -- not even the Wi-Fi, which would close the portal for good");
+    check(contains(none, "value=\"Ward 7\""), "the SSID is filled back in");
+
+    const std::string shortTok = std::string(40, 'c');
+    const std::string bad = ask(p, post("/save", formBody("net", "12345678", shortTok.c_str())));
+    check(statusLine(bad) == "HTTP/1.1 400 Bad Request" && contains(bad, "64 characters") && !contains(bad, shortTok),
+          "a malformed token is refused and not echoed back");
+    check(!wifi.has && !tokens.has, "and nothing is stored");
+
+    const std::string dup = ask(p, post("/save", formBody("net", "12345678", "a") + "&token=b"));
+    check(statusLine(dup) == "HTTP/1.1 400 Bad Request" && !wifi.has, "a duplicated token field is refused");
+
+    const std::string ok = ask(p, post("/save", formBody("net", "12345678", kTokenMixed.c_str())), 2000);
+    check(statusLine(ok) == "HTTP/1.1 200 OK" && wifi.has && tokens.has &&
+              std::string(tokens.rec.token) == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "a valid token is stored, lower-cased, with the Wi-Fi");
+    check(!contains(ok, "0123456789") && !contains(ok, "12345678"), "the saved page echoes neither token nor password");
+  }
+  {
+    MemWifiStore wifi;
+    MemTokenStore tokens;
+    makeTokenRecord(kTokenA, &tokens.rec);
+    tokens.has = true;
+    WifiPortal p(&wifi, "presence-00000C", 600000);
+    p.setTokenField(&tokens, TokenField::Optional);
+    p.begin(0, kOrigin);
+    const std::string form = ask(p, get("/"));
+    check(contains(form, "name=\"token\"") && !contains(form, "spellcheck=\"false\" required>") &&
+              contains(form, "already stored") && !contains(form, kTokenA),
+          "with a token already stored the field is optional and the stored one is not shown");
+    const std::string keep = ask(p, post("/save", formBody("net", "12345678", "")));
+    check(statusLine(keep) == "HTTP/1.1 200 OK" && wifi.has && tokens.saves == 0 && kTokenA == tokens.rec.token,
+          "an empty token keeps the stored one");
+  }
+  {
+    MemWifiStore wifi;
+    MemTokenStore tokens;
+    makeTokenRecord(kTokenA, &tokens.rec);
+    tokens.has = true;
+    WifiPortal p(&wifi, "presence-00000D", 600000);
+    p.setTokenField(&tokens, TokenField::Optional);
+    p.begin(0, kOrigin);
+    const std::string fresh(64, 'b');
+    ask(p, post("/save", formBody("net", "12345678", fresh.c_str())));
+    check(fresh == tokens.rec.token && wifi.has, "a new token replaces the stored one");
+  }
+  {
+    MemWifiStore wifi;
+    MemTokenStore tokens;
+    tokens.failSave = true;
+    WifiPortal p(&wifi, "presence-00000E", 600000);
+    p.setTokenField(&tokens, TokenField::Required);
+    p.begin(0, kOrigin);
+    const std::string r = ask(p, post("/save", formBody("net", "12345678", kTokenA.c_str())));
+    check(statusLine(r) == "HTTP/1.1 500 Internal Server Error" && !wifi.has && p.state() == PortalState::Open,
+          "a token that cannot be stored is a failure, and the Wi-Fi (the commit) is not written");
+    MemTokenStore liar;
+    liar.corruptOnLoad = true;
+    MemWifiStore wifi2;
+    WifiPortal q(&wifi2, "presence-00000F", 600000);
+    q.setTokenField(&liar, TokenField::Required);
+    q.begin(0, kOrigin);
+    const std::string r2 = ask(q, post("/save", formBody("net", "12345678", kTokenA.c_str())));
+    check(statusLine(r2) == "HTTP/1.1 500 Internal Server Error" && !wifi2.has,
+          "so is a token that does not read back the same");
+  }
+  {
+    MemWifiStore wifi;
+    WifiPortal p(&wifi, "presence-000010", 600000);
+    p.setTokenField(nullptr, TokenField::Required);
+    p.begin(0, kOrigin);
+    const std::string r = ask(p, post("/save", formBody("net", "12345678", kTokenA.c_str())));
+    check(statusLine(r) == "HTTP/1.1 500 Internal Server Error" && !wifi.has, "a required token with no store fails safe");
+  }
+}
+
+static void testProvisionExchange() {
+  printf("\nProvisioning: the terminal's side of /v1/device/provision\n");
+  const uint8_t mac[6] = {0x24, 0x6F, 0x28, 0xA1, 0xB2, 0xC3};
+  check(deviceSerial(mac) == "246F28A1B2C3", "the serial is the station MAC as 12 hex digits");
+  check(buildProvisionBody(deviceSerial(mac), "0.1.0") == "{\"serial\":\"246F28A1B2C3\",\"firmware_version\":\"0.1.0\"}",
+        "the body carries serial and firmware_version (openapi.yaml's required fields)");
+
+  check(classifyProvisionStatus(200) == ProvisionStatus::Ok, "200: provisioned");
+  check(classifyProvisionStatus(409) == ProvisionStatus::Refused, "409 (token consumed): forget the token");
+  check(classifyProvisionStatus(401) == ProvisionStatus::Refused && classifyProvisionStatus(403) == ProvisionStatus::Refused,
+        "401/403: forget the token");
+  for (int code : {501, 500, 503, 404, 429, -1, 0}) {
+    check(classifyProvisionStatus(code) == ProvisionStatus::Retry,
+          ("HTTP " + std::to_string(code) + ": keep the token and retry (501 is today's gateway)").c_str());
+  }
+
+  uint8_t raw[32];
+  check(decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", raw, 32), "base64 of 00..1f decodes");
+  bool seq = true;
+  for (int i = 0; i < 32; i++) seq = seq && raw[i] == i;
+  check(seq, "to exactly those bytes");
+  check(!decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", raw, 32), "unpadded is refused");
+  check(!decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh==", raw, 32), "wrong padding is refused");
+  check(!decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9=", raw, 32),
+        "non-zero trailing bits are refused (one secret, one encoding)");
+  check(!decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdH*8=", raw, 32), "a character outside the alphabet is refused");
+  check(!decodeBase64Exact("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd", raw, 32), "the wrong length is refused");
+
+  const std::string good =
+      "{\"device_id\":\"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f\","
+      "\"device_secret\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"key_version\":1,"
+      "\"org_id\":\"00000000-0000-0000-0000-000000000001\",\"config\":{\"config_version\":1},"
+      "\"server_time_ms\":1760000000000}";
+  ProvisionResult r;
+  check(parseProvisionResponse(good.c_str(), &r) && r.deviceId == "6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f" &&
+            r.keyVersion == 1 && r.serverTimeMs == 1760000000000LL && memcmp(r.secret, raw, 32) == 0,
+        "a 200 body yields device_id, the 32-byte secret, key_version and server_time_ms");
+
+  struct Case {
+    std::string body;
+    const char* name;
+  } bad[] = {
+      {"{}", "an empty object is refused"},
+      {"{\"device_secret\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"key_version\":1,\"server_time_ms\":1}",
+       "no device_id is refused"},
+      {"{\"device_id\":\"not-a-uuid\",\"device_secret\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\","
+       "\"key_version\":1,\"server_time_ms\":1}",
+       "a device_id that is not a UUID is refused"},
+      {"{\"device_id\":\"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f\",\"device_secret\":\"AAEC\",\"key_version\":1,"
+       "\"server_time_ms\":1}",
+       "a short secret is refused"},
+      {"{\"device_id\":\"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f\","
+       "\"device_secret\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"key_version\":0,\"server_time_ms\":1}",
+       "key_version 0 is refused"},
+      {"{\"device_id\":\"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f\","
+       "\"device_secret\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"key_version\":1}",
+       "no server_time_ms is refused"},
+      {"{\"note\":\"device_secret\",\"device_id\":\"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f\",\"key_version\":1,"
+       "\"server_time_ms\":1}",
+       "the key name appearing only as a value is not a secret"},
+  };
+  for (const Case& c : bad) {
+    ProvisionResult q;
+    const bool parsed = parseProvisionResponse(c.body.c_str(), &q);
+    bool zero = true;
+    for (uint8_t b : q.secret) zero = zero && b == 0;
+    check(!parsed && zero, c.name);
+  }
+}
+
 int main() {
   printf("PunchRecord = %zu bytes\n\n", sizeof(PunchRecord));
   testCanonicalString();
@@ -2265,6 +2647,12 @@ int main() {
   testPasswordNeverLogged();
   testSoftApSsid();
   testWifiResetTrigger();
+  testSetupKeyFormat();
+  testSetupSerialCommands();
+  testStationFallback();
+  testProvisionTokenRecord();
+  testPortalTokenField();
+  testProvisionExchange();
 
   printf("\n%s\n", failures == 0 ? "all firmware host tests passed" : "FAILURES");
   return failures == 0 ? 0 : 1;

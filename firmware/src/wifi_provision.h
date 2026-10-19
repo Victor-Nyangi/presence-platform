@@ -1,41 +1,53 @@
-// wifi_provision.h — first-boot Wi-Fi provisioning over a SoftAP captive portal.
+// wifi_provision.h — Wi-Fi provisioning over a WPA2 SoftAP captive portal.
 //
 // A terminal with no Wi-Fi credentials in NVS (first boot, or after the BOOT
-// button is held for 10 s) opens its own open access point, "presence-XXXXXX"
-// from the last three bytes of its MAC, answers every DNS name with its own
-// address, and serves one page: an SSID and password form. On a valid
-// submission it writes the credentials to NVS, reads them back, and only then
-// tells the installer they were saved and restarts into station mode. The
-// window is bounded; if nobody saves anything in time the AP goes down and
-// the terminal stays offline until it is power-cycled. docs/wifi-provisioning.md
-// has the design and the bench checklist.
+// button is held for 10 s) opens its own access point, "presence-XXXXXX" from
+// the last three bytes of its MAC, secured with WPA2 and a per-device password
+// printed on its label (the setup key, below). It answers every DNS name with
+// its own address and serves one page: SSID, password and, on a terminal that
+// has no device secret yet, the provisioning token (provision.h). On a valid
+// submission it writes them to NVS, reads them back, and only then tells the
+// installer they were saved and restarts into station mode.
+//
+// A terminal WITH saved credentials that cannot join that network within the
+// fall-back window after boot (StationFallback, 5 minutes) reopens the same
+// portal for one window, without erasing anything, then goes back to trying
+// the saved network, and alternates until one of them works. So a router that
+// comes back restores normal operation, and a router that was replaced can be
+// fixed without opening the case. docs/wifi-provisioning.md has the design and
+// the bench checklist.
 //
 // What the portal deliberately does NOT do:
 //
+// - OPEN WITHOUT A PASSWORD. No setup key in NVS means no setup network at
+//   all: the terminal waits for one over USB (firmware/tools/setup_label.py).
+//   The key is derived on the factory machine from the MAC and a factory
+//   secret that never reaches a terminal or this repo, so the label survives
+//   a full erase and no two terminals share a password.
 // - SERVE ANYTHING ELSE. routePortal() is the whole surface: the form, the
 //   save, and a redirect to the form for every other GET (that redirect is
 //   what makes phones pop the captive-portal sheet). No OTA, no punch data,
 //   no status, no device API. Everything else is a 404 or 405.
-// - LOG THE PASSWORD. describeWifi() is the only formatter for credentials,
-//   and it never includes it. The password is never echoed back into the
-//   page, and buffers that held it are zeroed. This is also why the portal
-//   does not use the Arduino WebServer: at CORE_DEBUG_LEVEL 5 (esp32dev-debug)
-//   it log_v()s every POST body, password included. The HTTP parsing here is
-//   small, bounded and under host test instead.
+// - LOG A SECRET. describeWifi() is the only formatter for credentials, and
+//   it never includes the password. Neither the password nor the token is
+//   echoed back into the page, and buffers that held them are zeroed. This is
+//   also why the portal does not use the Arduino WebServer: at
+//   CORE_DEBUG_LEVEL 5 (esp32dev-debug) it log_v()s every POST body. The HTTP
+//   parsing here is small, bounded and under host test instead.
 // - TAKE A GATEWAY URL. The gateway is a build constant (kApiBase). A field
 //   anyone in radio range can fill in during setup would let them point the
 //   terminal, and its provisioning token, at their own server.
 //
 // Ordering rule, in the spirit of "confirm the punch only after the flash
-// write": SAY "SAVED" ONLY AFTER THE NVS WRITE READS BACK. An installer told
-// the terminal is configured walks away; if it was not, the terminal reboots
-// into a closed window and sits offline.
+// write": SAY "SAVED" ONLY AFTER THE NVS WRITES READ BACK. The token is
+// written first and the Wi-Fi credentials last, because stored credentials
+// are what stops the portal opening at the next boot.
 //
 // The credentials are ONE NVS entry (like the ring cursors and the OTA
 // state), so a power cut cannot pair a new SSID with an old password.
 //
 // Free of Arduino headers so the host tests run the same parser, router,
-// validation and state machine. wifi_softap.h is the thin binding onto
+// validation and state machines. wifi_softap.h is the thin binding onto
 // WiFi/DNSServer/NVS.
 #pragma once
 
@@ -45,22 +57,14 @@
 
 #include <string>
 
+#include "provision.h"  // the token record, and secureZero
+
 namespace presence {
 
 constexpr size_t kWifiSsidMaxBytes = 32;        // 802.11
 constexpr size_t kWifiPassphraseMinBytes = 8;   // WPA2-PSK passphrase
 constexpr size_t kWifiPassphraseMaxBytes = 63;
 constexpr size_t kWifiPskHexChars = 64;         // a raw 256-bit PSK, as hex
-
-// Best effort: the compiler may not elide a write through volatile.
-inline void secureZero(void* p, size_t n) {
-  volatile uint8_t* v = static_cast<volatile uint8_t*>(p);
-  while (n--) *v++ = 0;
-}
-inline void secureZero(std::string* s) {
-  if (!s->empty()) secureZero(&(*s)[0], s->size());
-  s->clear();
-}
 
 // The persisted record. Changing the layout means bumping the magic: an
 // entry that does not match is treated as absent, which opens the portal.
@@ -208,6 +212,157 @@ inline std::string softApSsid(const uint8_t mac[6]) {
 }
 
 // --------------------------------------------------------------------
+// The setup key: the setup network's WPA2 password, printed on the label.
+// --------------------------------------------------------------------
+// Format "xxxx-xxxx-xxxx-xxxx": 16 characters from a 32-letter alphabet with
+// no 0/o, 1/l, so 80 bits that survive being read off a label and typed into
+// a phone. The terminal never derives it -- it cannot, the factory secret is
+// not on it -- it only checks the format and stores what setup_label.py sends
+// (derive() there: HMAC-SHA256(factory secret, "presence-setup-ap/v1\0" ||
+// MAC), first 10 bytes). One NVS entry, kept by the BOOT-button reset.
+constexpr char kSetupKeyAlphabet[] = "23456789abcdefghijkmnpqrstuvwxyz";
+static_assert(sizeof(kSetupKeyAlphabet) == 33, "the setup key alphabet is 32 letters");
+constexpr size_t kSetupKeyChars = 19;  // 4 groups of 4, 3 dashes
+
+struct __attribute__((packed)) SetupApKey {
+  uint32_t magic;
+  char key[kSetupKeyChars + 1];  // NUL-terminated
+};
+static_assert(sizeof(SetupApKey) == 24, "SetupApKey layout changed");
+constexpr uint32_t kSetupApKeyMagic = 0x314B4153u;  // "SAK1"
+
+inline bool validSetupKey(const char* s, size_t n) {
+  if (n != kSetupKeyChars) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (i % 5 == 4) {
+      if (s[i] != '-') return false;
+    } else if (s[i] == '\0' || strchr(kSetupKeyAlphabet, s[i]) == nullptr) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// makeSetupKey validates and fills *out. On any error *out is all zero.
+inline bool makeSetupKey(const std::string& key, SetupApKey* out) {
+  memset(out, 0, sizeof(*out));
+  if (!validSetupKey(key.data(), key.size())) return false;
+  out->magic = kSetupApKeyMagic;
+  memcpy(out->key, key.data(), key.size());
+  return true;
+}
+
+inline bool setupKeyUsable(const SetupApKey& k) {
+  return k.magic == kSetupApKeyMagic && k.key[kSetupKeyChars] == '\0' && validSetupKey(k.key, kSetupKeyChars);
+}
+
+class SetupKeyStore {
+ public:
+  virtual ~SetupKeyStore() = default;
+  virtual bool load(SetupApKey* out) = 0;
+  virtual bool save(const SetupApKey& k) = 0;
+};
+
+// loadUsableSetupKey: true with *out filled, or false with *out zeroed --
+// and false means NO setup network, never an open one.
+inline bool loadUsableSetupKey(SetupKeyStore* store, SetupApKey* out) {
+  if (store != nullptr && store->load(out) && setupKeyUsable(*out)) return true;
+  secureZero(out, sizeof(*out));
+  return false;
+}
+
+// The USB serial commands setup_label.py speaks, in every build:
+//   host: SETUP-ID\n              device: SETUP-ID mac=<12 hex> ssid=presence-XXXXXX key=present|absent
+//   host: SETUP-KEY <key>\n       device: SETUP-KEY OK | SETUP-KEY REJECT <reason>
+// The device never prints the key back. Anyone at the USB port can already
+// reflash or erase the terminal, so this grants nothing new.
+enum class SetupCommand : uint8_t { None, Id, SetKey, Malformed };
+
+inline SetupCommand parseSetupCommand(const char* line, size_t n, std::string* key) {
+  key->clear();
+  if (n < 6 || memcmp(line, "SETUP-", 6) != 0) return SetupCommand::None;
+  if (n == 8 && memcmp(line, "SETUP-ID", 8) == 0) return SetupCommand::Id;
+  if (n > 10 && memcmp(line, "SETUP-KEY ", 10) == 0) {
+    key->assign(line + 10, n - 10);
+    return SetupCommand::SetKey;
+  }
+  return SetupCommand::Malformed;
+}
+
+inline std::string setupIdLine(const uint8_t mac[6], bool keyPresent) {
+  std::string s = "SETUP-ID mac=";
+  s += deviceSerial(mac);
+  s += " ssid=";
+  s += softApSsid(mac);
+  s += keyPresent ? " key=present" : " key=absent";
+  return s;
+}
+
+// --------------------------------------------------------------------
+// Falling back to the portal when the saved network cannot be joined.
+// --------------------------------------------------------------------
+// The terminal and the portal never run the radio at the same time: an
+// ESP32 station hunting for a missing network hops channels, and the AP
+// (which must share the station's channel) drops the installer's phone each
+// time. So they alternate:
+//
+//   boot ──► station, saved network ──joined──► normal (fall-back disarmed)
+//               │ not joined within windowMs
+//               ▼
+//            setup portal, one window ──saved──► restart into the new network
+//               │ window over, nothing saved
+//               ▼
+//            station again, a fresh windowMs ... and so on
+//
+// Disarmed for good once the station has joined since boot. A link that
+// drops later is an outage, which retrying handles; a site whose Wi-Fi goes
+// down mid-day does not grow a setup network on every terminal. A power
+// cut is the common case anyway: the terminal boots in seconds and the
+// router takes minutes, which is what the window is sized for.
+class StationFallback {
+ public:
+  explicit StationFallback(uint32_t windowMs) : windowMs_(windowMs) {}
+
+  void begin(uint32_t nowMs) {
+    started_ = true;
+    joined_ = false;
+    windowStartMs_ = nowMs;
+  }
+
+  // portalDue: true while the portal should be opened (level, not edge: the
+  // caller opens it and then calls restart()).
+  bool portalDue(bool connected, uint32_t nowMs) {
+    if (!started_ || joined_) return false;
+    if (connected) {
+      joined_ = true;
+      return false;
+    }
+    return nowMs - windowStartMs_ >= windowMs_;
+  }
+
+  // restart: the portal closed with nothing saved; the station gets a fresh
+  // window on the saved network.
+  void restart(uint32_t nowMs) { windowStartMs_ = nowMs; }
+
+  // msUntilDue bounds the net task's sleep, so a long backoff cannot delay
+  // the portal. UINT32_MAX when it can never come due.
+  uint32_t msUntilDue(uint32_t nowMs) const {
+    if (!started_ || joined_) return UINT32_MAX;
+    const uint32_t elapsed = nowMs - windowStartMs_;
+    return elapsed >= windowMs_ ? 0 : windowMs_ - elapsed;
+  }
+
+  bool joined() const { return joined_; }
+  uint32_t windowMs() const { return windowMs_; }
+
+ private:
+  uint32_t windowMs_;
+  uint32_t windowStartMs_ = 0;
+  bool started_ = false;
+  bool joined_ = false;
+};
+
+// --------------------------------------------------------------------
 // application/x-www-form-urlencoded
 // --------------------------------------------------------------------
 // Decoded field values are capped well above anything valid, so validation
@@ -248,15 +403,21 @@ enum class FormError : uint8_t { Ok, Malformed, Duplicate, Missing, FieldTooLong
 struct WifiForm {
   std::string ssid;
   std::string password;
-  ~WifiForm() { secureZero(&password); }
+  std::string token;  // the provisioning token; empty when not sent
+  bool haveToken = false;
+  ~WifiForm() {
+    secureZero(&password);
+    secureZero(&token);
+  }
 };
 
-// parseWifiForm requires exactly one ssid and one password field. Unknown
-// fields are ignored (a browser may send the submit button), but must still
-// be well-formed. A missing password field is an error, not an open
+// parseWifiForm requires exactly one ssid and one password field, and at
+// most one token field (whether it is required is the portal's decision).
+// Unknown fields are ignored (a browser may send the submit button), but must
+// still be well-formed. A missing password field is an error, not an open
 // network: the form always sends one, so its absence is not a choice.
 inline FormError parseWifiForm(const char* body, size_t len, WifiForm* out) {
-  bool haveSsid = false, havePassword = false;
+  bool haveSsid = false, havePassword = false, haveToken = false;
   std::string key, value;
   size_t pos = 0;
   FormError result = FormError::Ok;
@@ -292,6 +453,13 @@ inline FormError parseWifiForm(const char* body, size_t len, WifiForm* out) {
           havePassword = true;
           out->password.swap(value);
         }
+      } else if (key == "token") {
+        if (haveToken) {
+          result = FormError::Duplicate;
+        } else {
+          haveToken = true;
+          out->token.swap(value);
+        }
       }
     }
     if (amp == nullptr) break;
@@ -302,7 +470,10 @@ inline FormError parseWifiForm(const char* body, size_t len, WifiForm* out) {
   if (result != FormError::Ok) {
     out->ssid.clear();
     secureZero(&out->password);
+    secureZero(&out->token);
+    haveToken = false;
   }
+  out->haveToken = haveToken;
   return result;
 }
 
@@ -515,9 +686,17 @@ inline std::string portalPage(const std::string& title, const std::string& inner
   return s;
 }
 
+// Whether the form asks for the provisioning token. Decided by main.cpp when
+// the portal opens: a terminal with a device secret has been provisioned and
+// has no use for one (Hidden: no field, and a submitted one is ignored); one
+// without a secret needs it (Required), unless one is already stored from an
+// earlier visit (Optional: empty keeps it, a new value replaces it).
+enum class TokenField : uint8_t { Hidden, Required, Optional };
+
 // The form. prefillSsid is echoed back (escaped) after an error so the
-// installer does not retype it; the password never is.
-inline std::string portalFormPage(const std::string& apSsid, const std::string& prefillSsid, const char* error) {
+// installer does not retype it; the password and the token never are.
+inline std::string portalFormPage(const std::string& apSsid, const std::string& prefillSsid, const char* error,
+                                  TokenField token = TokenField::Hidden) {
   std::string inner = "<h1>Connect this terminal to Wi-Fi</h1><p class=\"muted\">Terminal ";
   inner += htmlEscape(apSsid);
   inner += "</p>";
@@ -535,7 +714,18 @@ inline std::string portalFormPage(const std::string& apSsid, const std::string& 
       "\">"
       "<label for=\"password\">Password</label>"
       "<input id=\"password\" name=\"password\" type=\"password\" maxlength=\"64\" autocomplete=\"off\">"
-      "<p class=\"muted\">Leave the password empty only for an open network.</p>"
+      "<p class=\"muted\">Leave the password empty only for an open network.</p>";
+  if (token != TokenField::Hidden) {
+    inner +=
+        "<label for=\"token\">Provisioning token</label>"
+        "<input id=\"token\" name=\"token\" type=\"password\" maxlength=\"80\" autocomplete=\"off\" "
+        "autocapitalize=\"none\" autocorrect=\"off\" spellcheck=\"false\"";
+    inner += token == TokenField::Required ? " required>" : ">";
+    inner += token == TokenField::Required
+                 ? "<p class=\"muted\">The 64-character code from this terminal's installation sheet.</p>"
+                 : "<p class=\"muted\">A token is already stored. Leave this empty to keep it.</p>";
+  }
+  inner +=
       "<button type=\"submit\">Save and restart</button>"
       "</form>";
   return portalPage("Terminal Wi-Fi setup", inner);
@@ -546,7 +736,8 @@ inline std::string portalSavedPage(const std::string& ssid) {
   inner += htmlEscape(ssid);
   inner +=
       "</strong>. This setup network will disappear.</p>"
-      "<p class=\"muted\">If the terminal cannot join, hold its BOOT button for 10 seconds to start setup again.</p>";
+      "<p class=\"muted\">If the terminal cannot join that network, this setup network comes back after a few "
+      "minutes, with the same password. Holding its BOOT button for 10 seconds also starts setup again.</p>";
   return portalPage("Saved", inner);
 }
 
@@ -570,9 +761,17 @@ class WifiPortal {
     state_ = PortalState::Open;
   }
 
+  // setTokenField: ask for the provisioning token, and where to keep it.
+  // Without a call the field is Hidden.
+  void setTokenField(ProvisionTokenStore* store, TokenField mode) {
+    tokenStore_ = store;
+    tokenField_ = mode;
+  }
+
   PortalState state() const { return state_; }
   const std::string& apSsid() const { return apSsid_; }
   uint32_t timeoutMs() const { return timeoutMs_; }
+  TokenField tokenField() const { return tokenField_; }
 
   // handle answers one request. parsed is what parseHttpRequest returned
   // (Incomplete meaning the read timed out); req is only read when it is Ok.
@@ -594,7 +793,7 @@ class WifiPortal {
     switch (routePortal(req.method, req.path)) {
       case PortalRoute::Form:
         if (state_ == PortalState::Saved) return httpResponse(200, "OK", portalSavedPage(savedSsid_), !head);
-        return httpResponse(200, "OK", portalFormPage(apSsid_, std::string(), nullptr), !head);
+        return httpResponse(200, "OK", portalFormPage(apSsid_, std::string(), nullptr, tokenField_), !head);
       case PortalRoute::Redirect: {
         const std::string loc = "Location: " + origin_ + "\r\n";
         return httpResponse(302, "Found", std::string(), false, loc.c_str());
@@ -627,18 +826,54 @@ class WifiPortal {
     WifiForm form;
     const FormError fe = parseWifiForm(req.body.data(), req.body.size(), &form);
     if (fe != FormError::Ok) {
-      return httpResponse(400, "Bad Request", portalFormPage(apSsid_, std::string(), formErrorText(fe)), true);
+      return httpResponse(400, "Bad Request", portalFormPage(apSsid_, std::string(), formErrorText(fe), tokenField_),
+                          true);
     }
+    // Echo the SSID back only if it is printable; a control byte stays out.
+    const std::string prefill = validateSsid(form.ssid.data(), form.ssid.size()) == WifiFieldError::SsidBadByte
+                                    ? std::string()
+                                    : form.ssid.substr(0, kWifiSsidMaxBytes);
     WifiCredentials creds;
     const WifiFieldError ve = makeCredentials(form.ssid, form.password, &creds);
     if (ve != WifiFieldError::Ok) {
-      // Echo the SSID back only if it is printable; a control byte stays out.
-      const std::string prefill = validateSsid(form.ssid.data(), form.ssid.size()) == WifiFieldError::SsidBadByte
-                                      ? std::string()
-                                      : form.ssid.substr(0, kWifiSsidMaxBytes);
-      return httpResponse(400, "Bad Request", portalFormPage(apSsid_, prefill, wifiFieldErrorText(ve)), true);
+      return httpResponse(400, "Bad Request", portalFormPage(apSsid_, prefill, wifiFieldErrorText(ve), tokenField_),
+                          true);
     }
-    bool stored = store_ != nullptr && store_->save(creds);
+
+    // The token, when this portal asks for one. Hidden ignores whatever was
+    // sent: a provisioned terminal has no use for a token and keeps none.
+    ProvisionTokenRecord tok;
+    memset(&tok, 0, sizeof(tok));
+    bool saveToken = false;
+    if (tokenField_ != TokenField::Hidden) {
+      std::string t = form.token;
+      trimSpaces(&t);
+      const bool empty = t.empty();
+      secureZero(&t);
+      if (!(empty && tokenField_ == TokenField::Optional)) {
+        const TokenError te = makeTokenRecord(form.token, &tok);
+        if (te != TokenError::Ok) {
+          secureZero(&creds, sizeof(creds));
+          return httpResponse(400, "Bad Request", portalFormPage(apSsid_, prefill, tokenErrorText(te), tokenField_),
+                              true);
+        }
+        saveToken = true;
+      }
+    }
+
+    // Token first, Wi-Fi last: stored credentials are what keep the portal
+    // shut at the next boot, so they are the commit.
+    bool stored = true;
+    if (saveToken) {
+      stored = tokenStore_ != nullptr && tokenStore_->save(tok);
+      if (stored) {
+        ProvisionTokenRecord back;
+        stored = tokenStore_->load(&back) && memcmp(&back, &tok, sizeof(tok)) == 0;
+        secureZero(&back, sizeof(back));
+      }
+    }
+    secureZero(&tok, sizeof(tok));
+    stored = stored && store_ != nullptr && store_->save(creds);
     if (stored) {
       WifiCredentials back;
       stored = store_->load(&back) && memcmp(&back, &creds, sizeof(creds)) == 0;
@@ -647,7 +882,8 @@ class WifiPortal {
     secureZero(&creds, sizeof(creds));
     if (!stored) {
       return httpResponse(500, "Internal Server Error",
-                          portalFormPage(apSsid_, form.ssid, "The terminal could not store the settings. Try again."),
+                          portalFormPage(apSsid_, prefill, "The terminal could not store the settings. Try again.",
+                                         tokenField_),
                           true);
     }
     savedSsid_ = form.ssid;
@@ -657,6 +893,8 @@ class WifiPortal {
   }
 
   WifiCredentialStore* store_;
+  ProvisionTokenStore* tokenStore_ = nullptr;
+  TokenField tokenField_ = TokenField::Hidden;
   std::string apSsid_;
   std::string origin_;
   std::string savedSsid_;
