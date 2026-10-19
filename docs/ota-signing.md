@@ -237,8 +237,10 @@ do with esptool, and it exists only in that env.
 
 ## Verifying on hardware
 
-None of this has been run on a board. A freshly erased bench board has no Wi-Fi (it opens the
-setup portal instead; see *Known gaps*), so the serial loader stands in for the network path,
+None of this has been run on a board. A freshly erased bench board has no Wi-Fi (it has no setup
+key until `setup_label.py` writes one, and then it opens the setup portal; see *Known gaps*), and
+even on Wi-Fi it has no device secret to sign a heartbeat with until the gateway implements
+`/provision`. So the serial loader stands in for the network path,
 and `serial_ota.py --confirm` stands in for the first gateway heartbeat. The `esp32dev-debug` env shortens the confirm window to 2 minutes.
 Keys and images go outside the repo (here `~/ota-bench/`):
 
@@ -304,7 +306,8 @@ otherwise:
 - **Not run on a board.** Downgrade protection, rollback and the gateway endpoint are
   host-tested and the gateway side is tested end to end against Postgres; the hardware steps
   above have not been run.
-- **Wi-Fi comes from the SoftAP setup portal (2026-10-18), also not run on a board.** Until a
+- **Wi-Fi comes from the WPA2 SoftAP setup portal (2026-10-18, revised 2026-10-19), also not run
+  on a board, and the device secret from `/provision`, which the gateway still answers with 501.** Until a
   board has joined a network through it ([`wifi-provisioning.md`](wifi-provisioning.md)), the
   bench serial loader remains the test path. On a board with no Wi-Fi a new image can never
   send a heartbeat, so without `--confirm` it always rolls back, which is the safe failure.

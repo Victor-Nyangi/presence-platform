@@ -71,6 +71,15 @@ not use Wi-Fi at all. **Free in the OTA slot now: 900,847 B (45.8%)**, `esp32dev
 (32.3%); under `default.csv`, 245,487 B (18.7%). TLS (mbedTLS handshakes against a real gateway)
 is already linked, because `HTTPClient` was, so this should be most of the network stack's cost.
 
+**WPA2 setup network, fall-back and provisioning token (2026-10-19)**: the setup key and its
+serial commands, the station fall-back, the token field and the `/provision` exchange
+(`provision.h`) added 9,580 B of flash and 40 B of static RAM to `esp32dev`: app
+**1,074,813 B (54.7% of the slot)**, `firmware.bin` 1,081,392 B, static RAM 48,052 B.
+`esp32dev-debug`: app 1,126,581 B (57.3%), `firmware.bin` 1,133,152 B. Zero warnings, clean
+builds, same toolchain. **Free in the OTA slot now: 891,267 B (45.3%)**, `esp32dev-debug`
+839,499 B (42.7%); under the 2 × `0x180000` scheme 498,051 B (31.7%), under `default.csv`
+235,907 B (18.0%).
+
 Static RAM leaves out the FreeRTOS task stacks (8 + 4 + 16 KB) and the heap that WiFi/TLS allocate at runtime.
 
 ## OTA slack
