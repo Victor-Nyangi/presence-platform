@@ -47,13 +47,35 @@ terminal with both fingerprint slots bound — and prints the device secret
 once.
 
 ```
+device  55555555-5555-5555-5555-555555555555  SN-0001 (bidirectional, active)
+
 DEVICE_SECRET  90fc1acc7e787daf65860a3869f62f7a63aa321f5f1859cb4b6a4486e7a7abca
 key_version    1
+fingerprint    5f7c3fe3
 ```
 
 The row stores only ciphertext, sealed under your KEK with the device id as
-additional data, so that printout is the only time you see the raw key. Paste
-it into the terminal's NVS. `make seed RESET=1` reissues it — that tears down
+additional data, so that printout is the only time you see the raw key.
+
+**Loading it into a terminal:** flash the bench build (`pio run -e
+esp32dev-debug -t upload`), open `pio device monitor`, and paste one line (the
+terminal waits at most 1 s between characters, so do not type it):
+
+```
+BENCH-SECRET 55555555-5555-5555-5555-555555555555 <DEVICE_SECRET>
+```
+
+It writes `device_id`, `key_version` (1 unless given as a third field) and
+then `device_secret` to NVS — the layout a successful `/provision` leaves —
+reads them back, answers `BENCH-SECRET OK device=... key_version=1
+fingerprint=5f7c3fe3` and restarts into READY. Check that the fingerprint
+matches the one `make seed` printed; the secret itself is never echoed, and a
+malformed line gets `BENCH-SECRET REJECT <reason>` with nothing written.
+`BENCH-SECRET` exists only in `esp32dev-debug`: the release build has no such
+command, and `make firmware-test` fails if that changes (details and the
+bench steps: [`docs/wifi-provisioning.md`](docs/wifi-provisioning.md)).
+
+`make seed RESET=1` reissues the secret (load it again the same way) — that tears down
 the fixture, and because `punch_event` is append-only by trigger, the teardown
 has to disable that trigger to clear the device's history. It is a bench tool;
 do not point it at anything holding real attendance data.

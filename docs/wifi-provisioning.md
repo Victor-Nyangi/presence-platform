@@ -12,6 +12,8 @@ and the network path (heartbeat, upload, OTA) could not run on a board.
 | b | A terminal whose saved network cannot be joined for **5 minutes after boot** reopens the portal **without erasing anything**, then goes back to the saved network. The BOOT-hold reset is unchanged. |
 | c | The gateway URL stays a build constant. |
 | d | The portal **collects the provisioning token**, and the terminal exchanges it at `POST /v1/device/provision`. The gateway still answers 501, so only the firmware side is built (see *What the gateway must implement*). |
+| e | *(2026-10-19, later)* The gateway hashes the token's **32 decoded bytes**, not its hex text (`cryptobox.HashProvisionToken`). |
+| f | *(2026-10-19, later)* Until `/provision` works, a bench terminal gets its secret from `make seed` through the **bench-only `BENCH-SECRET` serial command**, compiled into `esp32dev-debug` only (*Loading a `make seed` secret on the bench*). |
 
 This doc covers the design, what is host-tested, and the bench checklist. **None of it has been
 run on a board.**
@@ -218,8 +220,12 @@ unauthenticated endpoint that hands out a secret. What the terminal now relies o
 1. **Token issue.** An installer-side action creates the `device` row in state `provisioning`
    with its `serial` (the MAC, as above) and `provision_token_hash = cryptobox.HashToken(pepper,
    token)`, and shows the token once as 64 hex digits (and a QR code). The schema already has the
-   columns. Decide, and write down, whether `HashToken` hashes the hex text or the 32 decoded
-   bytes; the terminal sends the hex text exactly as above.
+   columns. **Decided 2026-10-19 (owner): the hash is over the 32 decoded bytes, not the hex
+   text.** The terminal sends the hex text exactly as above; the gateway decodes it (64 hex
+   digits, either case, nothing else) and hashes the bytes, so one token has one digest however
+   it was spelled. Issue and exchange both go through `cryptobox.HashProvisionToken(pepper,
+   tokenHex)`, which does exactly that and refuses anything that is not 64 hex digits; a golden
+   digest in `cryptobox_test.go` fails if either side is ever changed to hash the header text.
 2. **Exchange.** `POST /v1/device/provision` looks the device up by the token hash (constant-time
    compare), checks the body's `serial` against the row, and in one transaction mints the 32-byte
    secret, seals it under the current KEK with the device id as AAD (as `seed` does), clears
@@ -231,7 +237,44 @@ unauthenticated endpoint that hands out a secret. What the terminal now relies o
    `gateway/internal/api` and `firmware/test/host_test.cpp`, the way the HMAC canonical string is,
    so the two cannot drift.
 
-Until then a bench terminal stays in `State::Provision` with its token stored, retrying a 501.
+Until then a bench terminal stays in `State::Provision` with its token stored, retrying a 501,
+unless it is given a `make seed` secret over USB (next section).
+
+### Loading a `make seed` secret on the bench
+
+`make seed` (README, *Getting a device onto the bench*) creates a device row and prints its id and
+secret once. **`BENCH-SECRET`** writes them into the terminal's NVS, in exactly the layout a
+successful `/provision` leaves (`storeDeviceIdentity()`), so the terminal boots straight into
+READY and signs with the seeded secret. Code: `firmware/src/bench_secret.h` (parser and
+fingerprint, host-tested) and `benchSecretCommand()` in `main.cpp`.
+
+| Host sends (one line) | Terminal answers |
+|---|---|
+| `BENCH-SECRET <device_id> <DEVICE_SECRET> [<key_version>]` | `BENCH-SECRET OK device=<id> key_version=<n> fingerprint=<8 hex>`, then `BENCH-SECRET restarting to load it` and a restart |
+| anything malformed | `BENCH-SECRET REJECT <reason>` (which field, never its value). Nothing is written |
+
+- `device_id` is the UUID on `make seed`'s `device` line, `DEVICE_SECRET` its 64 hex digits
+  (either case), `key_version` 1 if omitted, which is what `make seed` issues. A missing,
+  extra, short, long or non-hex field is refused.
+- **NVS** (namespace `presence`): `device_id` (string, lower case), `key_version` (int32), then
+  `device_secret` (32 bytes), the commit. An existing secret is removed first, so a write that
+  fails partway leaves an unprovisioned terminal, never a new id beside the old secret; any
+  read-back mismatch removes it again and answers `REJECT`.
+- **It never echoes the secret.** It reads the three values back and prints only the
+  fingerprint: the first 4 bytes of SHA-512 over the raw secret. `make seed` prints the same
+  value (`cryptobox.SecretFingerprint`; one golden vector pins both), and so does
+  `printf %s "$DEVICE_SECRET" | xxd -r -p | sha512sum | cut -c1-8`. The serial line is zeroed after use.
+- It **restarts** rather than swapping the secret under the network task, which may be signing
+  with the old one. Boot then loads it the way it loads a provisioned one, and erases a leftover
+  provisioning token.
+- **Bench build only.** It is compiled in under `PRESENCE_BENCH_SERIAL_OTA`, the flag only
+  `esp32dev-debug` defines, like the serial OTA loader. `make firmware-test` runs
+  `firmware/tools/check_bench_only.py`, which fails if the release env defines the flag or
+  `main.cpp` uses the command outside that `#ifdef`; given both built images it also checks the
+  release `firmware.bin` does not contain the string `BENCH-SECRET` and the debug one does. On a
+  release terminal the line gets no answer at all. Anyone at a bench board's USB port can already
+  reflash it, so the command grants nothing new there; on a deployed terminal it would let anyone
+  with a cable re-key it.
 
 ### NVS
 
@@ -296,7 +339,8 @@ USB, and needs `setup_label.py label` again afterwards.
 - **Not run on a board.** Captive-sheet behaviour on real phones, WPA2 association with the label
   password, the one-client cap, the fall-back alternation, and how `WiFiServer` behaves with a
   phone that opens sockets and sends nothing are all unverified.
-- **`/provision` has never completed**: the gateway answers 501 (above).
+- **`/provision` has never completed**: the gateway answers 501 (above). `BENCH-SECRET` gets a
+  bench board past PROVISION without it, but proves nothing about the exchange itself.
 - **TLS to the gateway is unchanged by this.** Once the terminal is on Wi-Fi it uses `HTTPClient`
   exactly as before, and the token now travels the same way. Whether that verifies the gateway's
   certificate is a separate question, not answered here, and it matters more now that a bearer
@@ -346,7 +390,14 @@ pio device monitor | tee ~/wifi-bench.log    # keep the whole capture for step 1
 | 20 | In the portal, save the right SSID with a **wrong** password | Saves and restarts, cannot join; after 60 s the portal comes back (step 17's line), alternating with 60 s of retrying |
 | 21 | Hold BOOT 10 s and let the first-boot portal sit 2 minutes with nothing saved | `Wi-Fi: setup closed with nothing saved; ...`; the network disappears and does not come back until a power cycle |
 | 22 | Optional: an open test network (hotspot without a password), with the password field left empty | `Wi-Fi: joining "<ssid>" (open network)` and it joins |
+| 23 | **Bench secret** (*Loading a `make seed` secret on the bench*). On the gateway machine: `make seed RESET=1` (`make seed` on an empty database). Save the `DEVICE_SECRET` value alone to `~/presence-bench-secret.txt` | It prints `device 55555555-5555-5555-5555-555555555555`, `DEVICE_SECRET`, `key_version 1` and a `fingerprint` |
+| 24 | Build the line in a text editor and **paste** it into the monitor, then Enter (typing is too slow: the terminal waits at most 1 s between characters, and the monitor does not echo): `BENCH-SECRET 55555555-5555-5555-5555-555555555555` and the secret **with its last digit missing** | `BENCH-SECRET REJECT the secret is not 64 hex digits`; no restart, still `state: PROVISION` |
+| 25 | Paste the line again with the whole secret | `BENCH-SECRET OK device=55555555-... key_version=1 fingerprint=` **the same 8 digits as step 23**, `restarting to load it`, then after the boot line `state: READY` (`FAULT` instead if no sensor is wired: a fault wins) and no `Provision:` lines. Against a real gateway heartbeats now succeed |
+| 26 | Power-cycle | Straight to `state: READY` again (or `FAULT`, as above): the secret is in NVS |
+| 27 | `grep -c -f ~/presence-bench-secret.txt ~/wifi-bench.log` | **0**: the secret appears nowhere in the capture |
+| 28 | Optional: flash `esp32dev` (the release build) and paste the step 25 line | No answer at all. (`python3 tools/check_bench_only.py --release-bin .pio/build/esp32dev/firmware.bin --debug-bin .pio/build/esp32dev-debug/firmware.bin` checks the same without a board.) Reflash `esp32dev-debug` afterwards |
 
 Afterwards, run `pio run -e esp32dev-debug -t erase` so the board does not keep the test network,
-then delete `~/wifi-bench.log` (it contains the test SSID) and `~/presence-bench-token.txt`. Keep
+then delete `~/wifi-bench.log` (it contains the test SSID), `~/presence-bench-token.txt` and
+`~/presence-bench-secret.txt`. Keep
 or delete `~/presence-bench-setup.key` as you like; it is a bench secret, not the factory one.
